@@ -1,66 +1,87 @@
-# Rustlog for Kick
+# rustlog-kick
 
-## Description
-Rustlog-kick is a [Kick](https://kick.com) chat logging service. It is a port of [rustlog](https://github.com/boring-nick/rustlog), the Twitch logger based on [justlog](https://github.com/gempir/justlog), and provides the same web UI and HTTP API, but with Kick channels and chats. Like the original it uses [Clickhouse](https://clickhouse.com) for storage instead of text files.
+> **Based on [rustlog](https://github.com/boring-nick/rustlog) by boring-nick.**
+> This project is a port of that Twitch chat logger to Kick. The architecture, HTTP API, ClickHouse schema and web interface originate there, and the original deserves the credit. Visit https://github.com/boring-nick/rustlog for the Twitch version.
 
-- Logs the chat of any Kick channel, no access to the channel needed and no account joins the chat (an app of a Kick account is only used to look up names and ids)
-- Messages, replies, subscriptions and gifts, hosts, bans and timeouts, deleted messages
-- Moderation as Kick publishes it: who banned or timed out a user, whether and when they were unbanned and by whom, which rules the AI moderation found deleted messages to violate, with [endpoints](./docs/API.md#moderation) for the history of a user and the actions of a channel
-- Same HTTP API and web interface as the Twitch version, plus [statistics endpoints](./docs/API.md#statistics): leaderboards by day, week, month and year, activity over time, the channels a user chats in, first and last messages
-- The same join limits as the original rustlog by default (90 channels per connection, no limit on connections, a new connection every 2 seconds), all of them adjustable in the config, see [KICK.md](./docs/KICK.md#scaling)
+A chat logging service for [Kick](https://kick.com). It keeps rustlog's HTTP API, web interface, ClickHouse schema and chat commands, so existing tooling and habits carry over.
 
-How it works and what differs from Twitch is described in [docs/KICK.md](./docs/KICK.md).
+Chat is stored in [ClickHouse](https://clickhouse.com) instead of text files, which keeps the logs small and the queries fast even for very large channels.
 
-## Installation
+## Features
 
-Create a `config.json` file (see [CONFIG.md](./docs/CONFIG.md)). You need a Kick app for the `clientID` and `clientSecret`, [CONFIG.md](./docs/CONFIG.md#creating-a-kick-app) explains how to create one.
+- **Anonymous logging.** Any public Kick channel can be logged. No account joins the chat and no channel access is needed. A Kick app is only used to look up names and ids.
+- **Complete chat history.** Messages, replies, subscriptions and gifts, raids, channel point rewards, bans, timeouts and deleted messages.
+- **Moderation history.** Who banned or timed out a user, when, for how long, whether and by whom it was lifted, and which rules Kick's AI moderation cited when it deleted a message. See the [moderation endpoints](./docs/API.md#moderation).
+- **Statistics.** Leaderboards by day, week, month and year, channel activity over time, the channels a user chats in, first and last messages. See the [statistics endpoints](./docs/API.md#statistics).
+- **Compatible API and UI.** The same routes and response formats as rustlog (text, JSON, ndjson, raw), the same web interface, and an OpenAPI reference served at `/docs`.
+- **Rustlog's join limits by default.** 90 channels per connection, no cap on connections, one new connection every two seconds. All three are configurable, see [Scaling](./docs/KICK.md#scaling).
+
+How chat reaches the logger and where Kick differs from Twitch is covered in [docs/KICK.md](./docs/KICK.md).
+
+## Getting started
+
+You need a Kick app for the `clientID` and `clientSecret` in the config. [docs/CONFIG.md](./docs/CONFIG.md#creating-a-kick-app) explains how to create one and lists every option.
 
 ### Docker
+
+Create a `config.json` next to a `docker-compose.yml`:
+
 ```yaml
-version: "3.8"
-  
 services:
   clickhouse:
-    image: clickhouse/clickhouse-server:latest
-    container_name: clickhouse
+    image: clickhouse/clickhouse-server:24.3
     volumes:
-      - "./ch-data:/var/lib/clickhouse:rw"
+      - ./ch-data:/var/lib/clickhouse
     environment:
-      CLICKHOUSE_DB: "rustlog"
-      CLICKHOUSE_USER: "user"
-      CLICKHOUSE_PASSWORD: "SuperSecretPassword"
+      CLICKHOUSE_DB: rustlog
+      CLICKHOUSE_USER: user
+      CLICKHOUSE_PASSWORD: SuperSecretPassword
     restart: unless-stopped
-        
+
   rustlog:
-    # the tag is the name of the branch the image was built from (`main` or `master`)
-    image: ghcr.io/<your-account>/<your-repository>:main
-    container_name: rustlog
+    image: ghcr.io/sery-yx/kicklog:main
     ports:
-      - 8025:8025 
+      - 8025:8025
     volumes:
-      - "./config.json:/config.json"
-    # Every connection to Kick's chat needs a socket, see the scaling notes
+      - ./config.json:/config.json
+    # every websocket connection to Kick needs a socket
     ulimits:
       nofile:
         soft: 65536
         hard: 65536
-    depends_on: 
+    depends_on:
       - clickhouse
     restart: unless-stopped
 ```
-The image is built by the GitHub workflow of this repository, or locally with `docker build -t rustlog-kick .`.
+
+Set `clickhouseUrl` to `http://clickhouse:8123` in the config, then run `docker compose up -d`.
+
+To build the image yourself, use `docker build -t rustlog-kick .`.
 
 ### From source
 
-- Follow the [Contributing](#contributing) excluding the last step
-- `cargo build --release`
-- The resulting binary will be at `target/release/rustlog-kick`
+Requirements: a current stable Rust toolchain, [yarn](https://yarnpkg.com), and `curl` at runtime (it is a fallback for looking up chatrooms, see [KICK.md](./docs/KICK.md#chatroom-ids)).
 
-`curl` should be installed (it is a fallback for looking up chatrooms, see [KICK.md](./docs/KICK.md#chatroom-ids)).
+```
+git clone https://github.com/sery-yx/kicklog.git
+cd kicklog
+
+# ClickHouse for development; the server must run in UTC (the default of the official image)
+docker compose -f docker-compose.dev.yml up -d
+
+cp config.dist.json config.json    # then add your Kick credentials
+
+# web interface
+cd web && yarn install && yarn build && cd ..
+
+cargo run --release
+```
+
+The web interface is then available at http://localhost:8025. A release binary is written to `target/release/rustlog-kick`.
 
 ## Usage
 
-Start logging channels by putting their slugs or user ids into `channels` in the config, or at runtime with the admin API:
+Channels are given as slugs (`xqc`) or Kick user ids. List them in `channels` in the config, or add them at runtime through the admin API:
 
 ```
 curl -X POST http://localhost:8025/admin/channels \
@@ -68,62 +89,48 @@ curl -X POST http://localhost:8025/admin/channels \
   -d '{"channels": ["xqc"]}'
 ```
 
-Admins (the `admins` list in the config) can do the same from chat with `!rustlog join <channel>` and `!rustlog leave <channel>`.
+Users listed in `admins` can do the same from chat with `!rustlog join <channel>` and `!rustlog leave <channel>`.
 
-Then open http://localhost:8025 for the web interface, or use the [API](./docs/API.md):
+A few requests to get a feel for the API:
 
 ```
 GET /channel/xqc/user/some-user?reverse&limit=50     recent messages of a user
-GET /channel/xqc/top?period=week                      most active chatters this week
-GET /user/some-user/channels                          where a user chats
+GET /channel/xqc/top?period=week                     most active chatters this week
+GET /channel/xqc/user/some-user/bans                 bans and timeouts of a user
+GET /user/some-user/channels                         the channels a user chats in
 ```
 
-## Advantages over justlog
+The full list is in [docs/API.md](./docs/API.md).
 
-- Significantly better storage efficiency (3x+ improvement) thanks to not duplicating log files, more efficient structure and better compression (using ZSTD in Clickhouse)
-- Blazing fast log queries with response streaming
-- Support for ndjson logs responses
+## Documentation
 
-## Contributing
+| Document | Contents |
+|----------|----------|
+| [docs/API.md](./docs/API.md) | HTTP API: logs, statistics, moderation, admin, opting out |
+| [docs/CONFIG.md](./docs/CONFIG.md) | Every config option and how to create a Kick app |
+| [docs/KICK.md](./docs/KICK.md) | How chat is collected, what is stored, scaling, known limitations |
+| [docs/MIGRATION.md](./docs/MIGRATION.md) | Importing existing raw logs |
 
-Requirements:
-- rust
-- yarn
-- docker with docker-compose (optional, will need to set up Clickhouse manually without it)
+## Development
 
-Steps:
+Requirements: Rust, yarn, and Docker for a local ClickHouse (or a ClickHouse installation of your own).
 
-1. Set up the database (Clickhouse):
-
-This repository provides a docker-compose to quickly set up Clickhouse. You can use it with:
 ```
-docker-compose -f docker-compose.dev.yml up -d
-```
-Alternatively, you can install Clickhouse manually using the [official guide](https://clickhouse.com/docs/en/install). The server has to run in UTC (the default of the official image).
-
-2. Create a config file
-
-Copy `config.dist.json` to `config.json` and configure your database and Kick credentials. If you installed Clickhouse with Docker, the default database configuration works.
-
-3. Build the frontend:
-```
-cd web
-yarn install
-yarn build
-cd ..
-```
-4. Build and run rustlog:
-```
-cargo run
+cargo test                       # unit tests, no database needed
+cargo clippy --all-targets
+cd web && yarn build             # frontend, embedded into the binary from web/dist
 ```
 
-You can now access rustlog at http://localhost:8025.
+The frontend is compiled into the binary, so run `yarn build` before `cargo build` and again after changing it. For frontend work, `yarn start` in `web/` serves it with hot reload against a backend running on port 8025.
 
-Run the tests with `cargo test`. They do not need a database.
+## Status
 
-## Importing logs
-See [MIGRATION.md](./docs/MIGRATION.md)
+This is a young port. Kick's chat websocket is unofficial and Kick may change it without notice, so expect to follow upstream changes now and then. Moderation events that happened while the logger was offline cannot be recovered. The remaining caveats are listed under [Known limitations](./docs/KICK.md#known-limitations).
+
+Bug reports and pull requests are welcome.
 
 ## Credits and license
 
-This project is a port of [boring-nick/rustlog](https://github.com/boring-nick/rustlog) and its web interface ([boring-nick/justlog](https://github.com/boring-nick/justlog), `frontend-only-new`), both MIT licensed. See [LICENSE](./LICENSE). It is not affiliated with Kick.
+This project is based on [boring-nick/rustlog](https://github.com/boring-nick/rustlog), including its web interface, which comes from a fork of [gempir/justlog](https://github.com/gempir/justlog). Both are MIT licensed. This project is released under the same license, see [LICENSE](./LICENSE), which keeps the original copyright notice.
+
+Not affiliated with or endorsed by Kick.

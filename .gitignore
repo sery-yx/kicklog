@@ -1,0 +1,7 @@
+/target
+/logs*
+config.json
+/ch-data
+/web/node_modules
+/web/dist/*
+!/web/dist/.gitkeep

@@ -1,0 +1,3 @@
+# Keep the line endings of the repository the same on every system. The Docker build runs shell
+# commands from files of this repository, which break with Windows line endings.
+* text=auto eol=lf

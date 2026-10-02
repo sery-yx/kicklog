@@ -1,0 +1,90 @@
+[package]
+name = "rustlog-kick"
+version = "0.1.0"
+edition = "2021"
+description = "Kick chat logging service backed by ClickHouse (a port of rustlog)"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+aide = { version = "0.15.0", features = [
+    "axum",
+    "axum-json",
+    "axum-query",
+    "scalar",
+] }
+anyhow = "1.0.75"
+axum = { version = "0.8.4", features = ["tokio"] }
+chrono = { version = "0.4.27", features = ["serde"] }
+clap = { version = "4.4.1", features = ["derive"] }
+clickhouse = { version = "0.13.0", default-features = false, features = [
+    "lz4",
+    "uuid",
+    "inserter",
+] }
+uuid = { version = "1.8.0", features = ["v4", "serde"] }
+dashmap = { version = "6.1.0", features = ["serde"] }
+flate2 = "1.0.27"
+futures = "0.3.28"
+indexmap = "2.2.6"
+lazy_static = "1.4.0"
+mimalloc = { version = "0.1.38", default-features = false }
+mime_guess = "2.0.4"
+prometheus = "0.13.3"
+rand = "0.9.0"
+rayon = "1.7.0"
+reqwest = { version = "0.12.4", features = [
+    "rustls-tls",
+    "json",
+], default-features = false }
+rust-embed = { version = "8.0.0", features = ["interpolate-folder-path"] }
+# Only used to install the `ring` crypto provider explicitly, see main.rs
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
+schemars = { version = "0.9", features = ["chrono04"] }
+serde = { version = "1.0.188", features = ["derive"] }
+serde_json = { version = "1.0.105", features = ["preserve_order"] }
+serde_repr = "0.1.16"
+strum = { version = "0.26.2", features = ["derive"] }
+thiserror = "1.0.47"
+tokio = { version = "1.32.0", features = [
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+# Kick delivers chat over a Pusher websocket
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+tower-http = { version = "0.6.1", features = [
+    "trace",
+    "cors",
+    "normalize-path",
+    "compression-full",
+] }
+tracing = "0.1.37"
+tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
+# IRC message parser, still used for the raw log importer and the `?raw` roundtrip
+tmi = { version = "0.7.0", default-features = false, features = ["simd"] }
+axum-prometheus = "0.8.0"
+metrics-prometheus = "0.8.0"
+axum-extra = { version = "0.10.0", features = ["typed-header"] }
+bitflags = { version = "2.5.0", features = ["serde"] }
+
+# Raises the limit of open files, every websocket connection to Kick needs one
+[target.'cfg(unix)'.dependencies]
+rlimit = "0.11"
+
+[dev-dependencies]
+pretty_assertions = "1.4.0"
+# Lets tests pause the clock, used to test the pacing of connections
+tokio = { version = "1.32.0", features = ["test-util"] }
+
+[profile.release]
+strip = true
+lto = "thin"

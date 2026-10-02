@@ -1,4 +1,4 @@
-# rustlog-kick
+# kicklog
 
 > **Based on [rustlog](https://github.com/boring-nick/rustlog) by boring-nick.**
 > This project is a port of that Twitch chat logger to Kick. The architecture, HTTP API, ClickHouse schema and web interface originate there, and the original deserves the credit. Visit https://github.com/boring-nick/rustlog for the Twitch version.
@@ -38,7 +38,7 @@ services:
       CLICKHOUSE_PASSWORD: SuperSecretPassword
     restart: unless-stopped
 
-  rustlog:
+  kicklog:
     image: ghcr.io/sery-yx/kicklog:main
     ports:
       - 8025:8025
@@ -56,7 +56,7 @@ services:
 
 Set `clickhouseUrl` to `http://clickhouse:8123` in the config, then run `docker compose up -d`.
 
-To build the image yourself, use `docker build -t rustlog-kick .`.
+To build the image yourself, use `docker build -t kicklog .`.
 
 ### From source
 

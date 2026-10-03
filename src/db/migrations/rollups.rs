@@ -17,11 +17,7 @@ pub struct MessageCountsDailyMigration;
 
 impl<'a> Migratable<'a> for MessageCountsDailyMigration {
     async fn run(&self, db: &'a clickhouse::Client) -> anyhow::Result<()> {
-        let select = format!(
-            "SELECT channel_id, toDate(timestamp) AS date, user_id, count() AS message_count
-            FROM message_structured
-            WHERE message_type = {CHAT_MESSAGE_TYPE} AND user_id != ''"
-        );
+        let select = daily_counts_select();
 
         db.query(
             "
@@ -69,6 +65,19 @@ impl<'a> Migratable<'a> for MessageCountsDailyMigration {
 
         Ok(())
     }
+}
+
+/// Selects the chat messages of `message_structured`, counted per channel, user and day (a
+/// condition on the partition can be added with `AND`, the `GROUP BY` is up to the caller).
+///
+/// The day is the day in UTC, whatever time zone the ClickHouse server is set to. The
+/// statistics endpoints work with calendar days in UTC.
+fn daily_counts_select() -> String {
+    format!(
+        "SELECT channel_id, toDate(toTimeZone(timestamp, 'UTC')) AS date, user_id, count() AS message_count
+        FROM message_structured
+        WHERE message_type = {CHAT_MESSAGE_TYPE} AND user_id != ''"
+    )
 }
 
 /// First message, last message and number of messages per user and channel
@@ -163,4 +172,26 @@ pub(super) async fn fill_by_partition(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn days_are_counted_in_utc() {
+        let select = daily_counts_select();
+
+        assert!(select.contains("toDate(toTimeZone(timestamp, 'UTC')) AS date"));
+        // a day taken from the time zone of the server would be a different one on a server
+        // which is not set to UTC
+        assert!(!select.contains("toDate(timestamp)"));
+    }
+
+    #[test]
+    fn a_condition_can_be_added_to_the_daily_counts() {
+        // the filter on the partition is added with AND, so the select must end with a
+        // complete condition
+        assert!(daily_counts_select().trim_end().ends_with("user_id != ''"));
+    }
 }

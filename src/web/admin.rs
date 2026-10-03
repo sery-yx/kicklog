@@ -1,4 +1,4 @@
-use crate::{app::App, bot::BotMessage, error::Error};
+use crate::{app::App, bot::BotMessage, db, error::Error, web::schema::UserHasLogs};
 use aide::{
     openapi::{
         HeaderStyle, Parameter, ParameterData, ParameterSchemaOrContent, ReferenceOr, SchemaObject,
@@ -67,6 +67,14 @@ pub struct ChannelsRequest {
     pub channels: Vec<String>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+pub struct UsersRequest {
+    /// Kick user id of the channel
+    pub channel: String,
+    /// List of Kick user ids
+    pub users: Vec<String>,
+}
+
 pub async fn add_channels(
     Extension(bot_tx): Extension<Sender<BotMessage>>,
     app: State<App>,
@@ -98,4 +106,13 @@ pub async fn remove_channels(
         .unwrap();
 
     Ok(())
+}
+
+pub async fn check_users_existence(
+    app: State<App>,
+    Json(UsersRequest { channel, users }): Json<UsersRequest>,
+) -> Result<Json<Vec<UserHasLogs>>, Error> {
+    let users = db::check_users_exist(&app.db, &channel, &users).await?;
+
+    Ok(Json(users))
 }

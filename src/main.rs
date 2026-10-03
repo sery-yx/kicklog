@@ -25,11 +25,11 @@ use mimalloc::MiMalloc;
 use std::{
     env,
     future::Future,
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::{mpsc, watch},
+    sync::{broadcast, mpsc, watch},
     time::timeout,
 };
 use tracing::{debug, info};
@@ -41,6 +41,9 @@ const SHUTDOWN_TIMEOUT_SECONDS: u64 = 8;
 /// Without a limit on the connections to Kick the file descriptor limit is raised to allow about
 /// this many of them, which is more than anybody is going to need
 const UNLIMITED_CONNECTIONS_ESTIMATE: usize = 60_000;
+/// How many messages a client of the firehose may fall behind. A client which falls further
+/// behind is disconnected.
+const FIREHOSE_BUFFER_SIZE: usize = 1000;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -78,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
         db = db.with_password(password);
     }
 
-    setup_db(&db, &config.clickhouse_db)
+    setup_db(&db, &config)
         .await
         .context("Could not run DB migrations")?;
 
@@ -93,11 +96,15 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run(config: Config, db: clickhouse::Client) -> anyhow::Result<()> {
+    let channels = db::read_channels(&db)
+        .await
+        .context("Could not read the logged channels")?;
+    let opt_outs = db::read_opt_outs(&db)
+        .await
+        .context("Could not read the opt outs")?;
+
     // Every connection to Kick needs a file descriptor
-    let connections_needed = config
-        .channels
-        .read()
-        .unwrap()
+    let connections_needed = channels
         .len()
         .div_ceil(config.pusher_max_channels_per_connection.max(1));
     let connections_to_prepare_for = config
@@ -120,13 +127,18 @@ async fn run(config: Config, db: clickhouse::Client) -> anyhow::Result<()> {
     )
     .await?;
 
+    let (firehose_tx, _) = broadcast::channel(FIREHOSE_BUFFER_SIZE);
+
     let app = App {
         kick: Arc::new(kick),
         users: UsersCache::default(),
+        channels: Arc::new(RwLock::new(channels)),
         config: Arc::new(config),
         db: Arc::new(db),
         optout_codes: Arc::default(),
+        optout_users: Arc::new(opt_outs),
         flush_buffer,
+        firehose_tx,
     };
 
     // Joining many channels takes a while (every unknown chatroom is looked up on Kick's

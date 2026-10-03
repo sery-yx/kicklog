@@ -30,7 +30,7 @@ use axum::{
 };
 use axum_extra::{headers::CacheControl, TypedHeader};
 use chrono::{DateTime, NaiveDate, Utc};
-use dashmap::DashMap;
+use dashmap::DashSet;
 use std::collections::HashMap;
 
 pub(super) const DEFAULT_LIMIT: u64 = 10;
@@ -57,7 +57,7 @@ pub async fn get_channel_top(
     let limit = clamp_limit(params.limit, DEFAULT_LIMIT);
 
     // Users who opted out are not counted
-    let excluded = opted_out_ids(&app.config.opt_out);
+    let excluded = opted_out_ids(&app.optout_users);
     let (message_count, rows) =
         analytics::get_top_chatters(&app.db, &channel_id, range, limit, &excluded).await?;
 
@@ -95,7 +95,7 @@ pub async fn get_top_channels(
     let limit = clamp_limit(params.limit, DEFAULT_LIMIT);
 
     // Channels which opted out are not listed
-    let excluded = opted_out_ids(&app.config.opt_out);
+    let excluded = opted_out_ids(&app.optout_users);
     let rows = analytics::get_top_channels(&app.db, range, limit, &excluded).await?;
 
     let channel_ids = rows.iter().map(|row| row.channel_id.clone()).collect();
@@ -136,7 +136,7 @@ pub async fn get_channel_activity(
 
     let range = resolve_activity_range(&params, Utc::now().date_naive())?;
     // Users who opted out are not counted
-    let excluded = opted_out_ids(&app.config.opt_out);
+    let excluded = opted_out_ids(&app.optout_users);
     let buckets = analytics::get_channel_activity(
         &app.db,
         &channel_id,
@@ -184,7 +184,7 @@ pub async fn get_user_rank(
 
     let range = resolve_period(params.period, params.date.as_deref())?;
     // Users who opted out are not counted
-    let excluded = opted_out_ids(&app.config.opt_out);
+    let excluded = opted_out_ids(&app.optout_users);
     let rank =
         analytics::get_user_rank(&app.db, &channel_id, &user_id, range, &excluded).await?;
     let user_login = app
@@ -271,7 +271,7 @@ pub async fn get_user_channels(
     let offset = params.offset.unwrap_or(0);
 
     // Channels which opted out are not listed
-    let excluded = opted_out_ids(&app.config.opt_out);
+    let excluded = opted_out_ids(&app.optout_users);
     let rows = analytics::get_user_channels(
         &app.db,
         &user_id,
@@ -329,14 +329,14 @@ pub async fn get_user_last_message(
     let line = match app
         .flush_buffer
         .last_message_by_user(&user_id, |message| {
-            !app.config.opt_out.contains_key(&*message.channel_id)
+            !app.optout_users.contains(&*message.channel_id)
         })
         .await
     {
         Some(line) => line,
         None => {
             // The newest channel which has not opted out
-            let excluded = opted_out_ids(&app.config.opt_out);
+            let excluded = opted_out_ids(&app.optout_users);
             let channel = analytics::get_user_channels(
                 &app.db,
                 &user_id,
@@ -369,7 +369,7 @@ pub async fn get_user_summary(
     check_user_not_opted_out(&app, &user_id)?;
 
     // Channels which opted out are not counted
-    let excluded = opted_out_ids(&app.config.opt_out);
+    let excluded = opted_out_ids(&app.optout_users);
     let summary = analytics::get_user_summary(&app.db, &user_id, &excluded)
         .await?
         .ok_or(Error::NotFound)?;
@@ -431,8 +431,8 @@ pub(super) fn clamp_limit(limit: Option<u64>, default: u64) -> u64 {
 
 /// The ids of everybody who opted out. Users and channels share the list. It is sorted, so the
 /// same queries are sent while nobody changes, which lets the database reuse their results.
-pub(super) fn opted_out_ids(opt_out: &DashMap<String, bool>) -> Vec<String> {
-    let mut ids: Vec<String> = opt_out.iter().map(|entry| entry.key().clone()).collect();
+pub(super) fn opted_out_ids(opt_out: &DashSet<String>) -> Vec<String> {
+    let mut ids: Vec<String> = opt_out.iter().map(|id| id.clone()).collect();
     ids.sort_unstable();
     ids
 }
@@ -582,12 +582,12 @@ mod tests {
 
     #[test]
     fn opted_out_ids_are_sorted() {
-        let opt_out: DashMap<String, bool> = DashMap::new();
+        let opt_out: DashSet<String> = DashSet::new();
         assert_eq!(opted_out_ids(&opt_out), Vec::<String>::new());
 
-        opt_out.insert("676".to_owned(), true);
-        opt_out.insert("123".to_owned(), true);
-        opt_out.insert("45".to_owned(), true);
+        opt_out.insert("676".to_owned());
+        opt_out.insert("123".to_owned());
+        opt_out.insert("45".to_owned());
 
         assert_eq!(opted_out_ids(&opt_out), vec!["123", "45", "676"]);
     }

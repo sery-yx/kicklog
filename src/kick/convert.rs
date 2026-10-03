@@ -1097,7 +1097,7 @@ mod tests {
 
         let full = FullMessage::from_structured(&message).unwrap();
         assert_eq!(full.username, "some-user");
-        assert_eq!(full.channel, "xqc");
+        assert_eq!(full.basic.channel, "xqc");
         assert_eq!(full.basic.display_name, "Some_User");
         assert_eq!(full.basic.text, "hi");
         assert_eq!(full.basic.id, CHAT_ID);

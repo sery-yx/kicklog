@@ -11,27 +11,48 @@ use crate::{
     app::App,
     db::{
         self, read_available_channel_logs, read_available_user_logs, read_channel,
-        read_random_channel_line, read_random_user_line, read_user,
+        read_random_channel_line, read_random_user_line, read_user, schema::StructuredMessage,
     },
     error::Error,
-    logs::{schema::LogRangeParams, stream::LogsStream},
+    logs::{
+        schema::{
+            message::{BasicMessage, ResponseMessage},
+            LogRangeParams,
+        },
+        stream::LogsStream,
+    },
     web::schema::LogsPathDate,
-    Result,
+    Result, ShutdownRx,
 };
 use aide::axum::IntoApiResponse;
 use axum::{
-    extract::{Path, Query, RawQuery, State},
+    extract::{
+        ws::{Message, WebSocket},
+        Path, Query, RawQuery, State, WebSocketUpgrade,
+    },
     response::{IntoResponse, Redirect, Response},
-    Json,
+    Extension, Json,
 };
 use axum_extra::{headers::CacheControl, TypedHeader};
 use chrono::{DateTime, Days, Months, NaiveDate, NaiveTime, Utc};
+use futures::{SinkExt, StreamExt};
+use lazy_static::lazy_static;
+use prometheus::{register_int_gauge, IntGauge};
 use rand::{distr::Alphanumeric, rng, Rng};
 use std::time::Duration;
+use tokio::sync::broadcast::{self, error::RecvError};
 use tracing::debug;
 
+lazy_static! {
+    static ref FIREHOSE_CLIENTS_GAUGE: IntGauge = register_int_gauge!(
+        "rustlog_firehose_clients_count",
+        "How many firehose clients are connected to the websocket",
+    )
+    .unwrap();
+}
+
 pub async fn get_channels(app: State<App>) -> Result<impl IntoApiResponse> {
-    let channel_ids = app.config.channels.read().unwrap().clone();
+    let channel_ids = app.channels.read().unwrap().clone();
 
     let channels = app
         .get_channels_by_entries(Vec::from_iter(channel_ids), false)
@@ -379,6 +400,105 @@ pub async fn get_user_name_history(
     Ok(Json(names))
 }
 
+/// A websocket which sends every message that is logged, in all channels, as it arrives:
+/// as an IRC style line, or as the JSON of `jsonBasic` if the parameter is given. Users who opted
+/// out are not part of it, as they are not logged.
+pub async fn firehose(
+    app: State<App>,
+    Extension(shutdown_rx): Extension<ShutdownRx>,
+    ws: WebSocketUpgrade,
+    Query(logs_params): Query<LogsParams>,
+) -> impl IntoResponse {
+    let firehose_rx = app.firehose_tx.subscribe();
+
+    ws.on_upgrade(move |socket| {
+        firehose_socket(socket, firehose_rx, shutdown_rx, logs_params.json_basic)
+    })
+}
+
+/// What is sent to a client for a message. `None` if the message cannot be turned into JSON.
+fn firehose_text(message: &StructuredMessage<'_>, json_basic: bool) -> Option<String> {
+    if !json_basic {
+        return Some(message.to_raw_irc());
+    }
+
+    match BasicMessage::from_structured(message) {
+        Ok(basic) => match serde_json::to_string(&basic) {
+            Ok(json) => Some(json),
+            Err(err) => {
+                debug!("Could not serialize a message for the firehose: {err}");
+                None
+            }
+        },
+        Err(err) => {
+            debug!("Could not convert a message for the firehose: {err}");
+            None
+        }
+    }
+}
+
+async fn firehose_socket(
+    socket: WebSocket,
+    mut firehose_rx: broadcast::Receiver<StructuredMessage<'static>>,
+    mut shutdown_rx: ShutdownRx,
+    json_basic: bool,
+) {
+    let (mut sender, mut receiver) = socket.split();
+
+    let mut send_task = tokio::spawn(async move {
+        loop {
+            // The server does not finish shutting down while a websocket is open, so the
+            // websockets close when it is asked to shut down
+            let received = tokio::select! {
+                received = firehose_rx.recv() => received,
+                _ = shutdown_rx.changed() => {
+                    let _ = sender.send(Message::Close(None)).await;
+                    break;
+                }
+            };
+
+            let message = match received {
+                Ok(message) => message,
+                Err(RecvError::Lagged(skipped)) => {
+                    // Messages were missed, which a client has to be told about by being
+                    // disconnected: it can connect again
+                    debug!("A firehose client fell behind by {skipped} messages");
+                    break;
+                }
+                Err(RecvError::Closed) => break,
+            };
+
+            let Some(text) = firehose_text(&message, json_basic) else {
+                continue;
+            };
+            if sender.send(Message::Text(text.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Nothing is expected from the client, but reading is what notices that it went away
+    let mut recv_task = tokio::spawn(async move {
+        while let Some(Ok(_)) = receiver.next().await {
+            debug!("Received a message on the firehose websocket");
+        }
+    });
+
+    debug!("Firehose client connected");
+    FIREHOSE_CLIENTS_GAUGE.inc();
+
+    tokio::select! {
+        _ = &mut send_task => {},
+        _ = &mut recv_task => {},
+    }
+    // The other half has no reason to go on
+    send_task.abort();
+    recv_task.abort();
+
+    debug!("Firehose client disconnected");
+    FIREHOSE_CLIENTS_GAUGE.dec();
+}
+
 pub async fn optout(app: State<App>) -> Json<String> {
     let mut rng = rng();
     let optout_code: String = (0..5).map(|_| rng.sample(Alphanumeric) as char).collect();
@@ -424,4 +544,48 @@ pub(super) async fn resolve_user_params(
         UserIdType::Id => params.user.clone(),
     };
     Ok((channel_id, user_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::schema::MessageType;
+    use std::borrow::Cow;
+
+    fn chat_message() -> StructuredMessage<'static> {
+        let mut message = StructuredMessage::new(
+            "676".to_owned(),
+            "xqc".to_owned(),
+            1790923082123,
+            MessageType::PrivMsg,
+        );
+        message.user_id = Cow::Borrowed("12345");
+        message.user_login = Cow::Borrowed("some-user");
+        message.display_name = Cow::Borrowed("Some_User");
+        message.text = Cow::Borrowed("hello");
+        message
+    }
+
+    #[test]
+    fn the_firehose_sends_irc_lines_by_default() {
+        let text = firehose_text(&chat_message(), false).unwrap();
+
+        assert!(text.starts_with('@'));
+        assert!(text.ends_with(":some-user!some-user@some-user.kick.com PRIVMSG #xqc :hello"));
+    }
+
+    #[test]
+    fn the_firehose_can_send_the_json_of_json_basic() {
+        let text = firehose_text(&chat_message(), true).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["text"], "hello");
+        assert_eq!(json["displayName"], "Some_User");
+        assert_eq!(json["channel"], "xqc");
+        assert_eq!(json["tags"]["room-id"], "676");
+        assert_eq!(json["tags"]["user-id"], "12345");
+        // jsonBasic does not have what the full format adds
+        assert!(json.get("raw").is_none());
+        assert!(json.get("username").is_none());
+    }
 }

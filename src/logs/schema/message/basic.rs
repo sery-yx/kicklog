@@ -13,6 +13,8 @@ use super::ResponseMessage;
 pub struct BasicMessage<'a> {
     pub text: Cow<'a, str>,
     pub display_name: &'a str,
+    /// The login (slug) of the channel
+    pub channel: &'a str,
     pub timestamp: DateTime<Utc>,
     pub id: Cow<'a, str>,
     pub tags: HashMap<&'a str, Cow<'a, str>>,
@@ -23,6 +25,7 @@ impl<'a> ResponseMessage<'a> for BasicMessage<'a> {
         Ok(Self {
             text: msg.user_friendly_text(),
             display_name: msg.display_name(),
+            channel: &msg.channel_login,
             timestamp: chrono::DateTime::from_timestamp_millis(msg.timestamp.try_into()?)
                 .context("Invalid timestamp")?,
             id: Cow::Owned(msg.id().unwrap_or_default()),
@@ -58,5 +61,21 @@ mod tests {
             "daney___ subscribed at Tier 1. They've subscribed for 19 months!",
             basic.tags.get("system-msg").unwrap()
         );
+    }
+
+    #[test]
+    fn includes_the_channel() {
+        let unstructured = UnstructuredMessage {
+            channel_id: "22484632",
+            user_id: "62541963",
+            timestamp: 1489263601000,
+            raw: "@room-id=22484632;user-id=62541963;tmi-sent-ts=1489263601000 :snusbot!snusbot@snusbot.kick.com PRIVMSG #forsen :hi",
+        };
+        let structured = StructuredMessage::from_unstructured(&unstructured).unwrap();
+        let basic = BasicMessage::from_structured(&structured).unwrap();
+
+        assert_eq!(basic.channel, "forsen");
+        let json = serde_json::to_value(&basic).unwrap();
+        assert_eq!(json["channel"], "forsen");
     }
 }

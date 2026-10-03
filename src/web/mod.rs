@@ -21,6 +21,7 @@ use axum::{
     extract::Request,
     middleware::{self, Next},
     response::{IntoResponse, Response},
+    routing::any,
     Extension, Json, ServiceExt,
 };
 use axum_prometheus::PrometheusMetricLayerBuilder;
@@ -47,6 +48,7 @@ const CAPABILITIES: &[&str] = &[
     "user-channels",
     "user-summary",
     "moderation",
+    "firehose",
 ];
 
 pub async fn run(app: App, mut shutdown_rx: ShutdownRx, bot_tx: Sender<BotMessage>) {
@@ -62,6 +64,8 @@ pub async fn run(app: App, mut shutdown_rx: ShutdownRx, bot_tx: Sender<BotMessag
         parse_listen_addr(&app.config.listen_address).expect("Invalid listen address");
 
     let cors = CorsLayer::permissive();
+    // For the websockets, which have to be closed for the server to shut down
+    let firehose_shutdown_rx = shutdown_rx.clone();
 
     let mut api = OpenApi::default();
 
@@ -75,6 +79,14 @@ pub async fn run(app: App, mut shutdown_rx: ShutdownRx, bot_tx: Sender<BotMessag
             .delete_with(admin::remove_channels, |mut op| {
                 admin::admin_auth_doc(&mut op);
                 op.tag("Admin").description("Leave the specified channels")
+            }),
+        )
+        .api_route(
+            "/check-users",
+            post_with(admin::check_users_existence, |mut op| {
+                admin::admin_auth_doc(&mut op);
+                op.tag("Admin")
+                    .description("Check if the specified users have logs in the specified channel")
             }),
         )
         .route_layer(middleware::from_fn_with_state(app.clone(), admin_auth))
@@ -266,6 +278,7 @@ pub async fn run(app: App, mut shutdown_rx: ShutdownRx, bot_tx: Sender<BotMessag
         )
         .api_route("/optout", post(handlers::optout))
         .api_route("/capabilities", get(capabilities))
+        .route("/firehose", any(handlers::firehose))
         .route("/docs", Scalar::new("/openapi.json").axum_route())
         .route("/openapi.json", get(serve_openapi))
         .route("/assets/{*asset}", get(frontend::static_asset))
@@ -284,6 +297,7 @@ pub async fn run(app: App, mut shutdown_rx: ShutdownRx, bot_tx: Sender<BotMessag
         .route("/metrics", get(metrics))
         .finish_api(&mut api)
         .layer(Extension(Arc::new(api)))
+        .layer(Extension(firehose_shutdown_rx))
         .with_state(app)
         .layer(cors)
         .layer(CompressionLayer::new().quality(CompressionLevel::Fastest));
@@ -334,4 +348,187 @@ async fn metrics() -> impl IntoApiResponse {
 }
 async fn serve_openapi(Extension(api): Extension<Arc<OpenApi>>) -> impl IntoApiResponse {
     Json(api.as_ref()).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::schema::{MessageType, StructuredMessage};
+    use futures::StreamExt;
+    use std::{borrow::Cow, time::Duration};
+    use tokio::{
+        sync::{mpsc, watch},
+        time::{sleep, timeout},
+    };
+    use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn chat_message(user_id: &'static str, text: &'static str) -> StructuredMessage<'static> {
+        let mut message = StructuredMessage::new(
+            "676".to_owned(),
+            "xqc".to_owned(),
+            1790923082123,
+            MessageType::PrivMsg,
+        );
+        message.user_id = Cow::Borrowed(user_id);
+        message.user_login = Cow::Borrowed("some-user");
+        message.display_name = Cow::Borrowed("Some_User");
+        message.text = Cow::Borrowed(text);
+        message
+    }
+
+    async fn next_text<S>(socket: &mut S) -> String
+    where
+        S: futures::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    {
+        match timeout(Duration::from_secs(5), socket.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => text.to_string(),
+            other => panic!("expected a text frame, got {other:?}"),
+        }
+    }
+
+    /// Starts the real server (all routes and layers, as in production) on a free port.
+    /// It is not connected to ClickHouse or Kick, which is only needed by what these tests
+    /// do not ask for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_server_serves_the_firehose_and_the_new_routes() {
+        // reqwest builds its TLS configuration even for plain http
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let port = free_port();
+        let app = App::for_tests(&format!("127.0.0.1:{port}"));
+        let firehose_tx = app.firehose_tx.clone();
+        app.optout_users.insert("999".to_owned());
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let (bot_tx, _bot_rx) = mpsc::channel(1);
+        let server = tokio::spawn(run(app, shutdown_rx, bot_tx));
+
+        let mut listening = false;
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                listening = true;
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        assert!(listening, "the server did not start");
+
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+
+        // the capabilities, in the document and in the header
+        let response = client
+            .get(format!("{base}/capabilities"))
+            .send()
+            .await
+            .unwrap();
+        assert!(response
+            .headers()
+            .get("x-rustlog-capabilities")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(',')
+            .any(|capability| capability == "firehose"));
+        let capabilities: Vec<String> = response.json().await.unwrap();
+        assert!(capabilities.contains(&"firehose".to_owned()));
+
+        // the new admin route is documented, and (like the other admin routes) needs the key
+        let openapi: serde_json::Value = client
+            .get(format!("{base}/openapi.json"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(openapi["paths"]["/admin/check-users"]["post"].is_object());
+        assert!(openapi["paths"]["/admin/channels"]["post"].is_object());
+
+        let body = serde_json::json!({"channel": "676", "users": ["1", "2"]});
+        let response = client
+            .post(format!("{base}/admin/check-users"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403);
+        // with the key the request is let through, and only fails because there is no database
+        let response = client
+            .post(format!("{base}/admin/check-users"))
+            .header("X-Api-Key", "test-key")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 500);
+
+        // opt outs are refused and marked, before the database is asked anything
+        let response = client
+            .get(format!("{base}/channelid/676/userid/999"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403);
+        assert_eq!(response.headers().get("x-opt-out").unwrap(), "true");
+        let response = client
+            .get(format!("{base}/channelid/999/userid/1"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403);
+        assert_eq!(response.headers().get("x-opt-out").unwrap(), "true");
+
+        // the firehose: IRC lines by default, the JSON of jsonBasic on request
+        let (mut raw, _) = connect_async(format!("ws://127.0.0.1:{port}/firehose"))
+            .await
+            .unwrap();
+        let (mut json, _) = connect_async(format!("ws://127.0.0.1:{port}/firehose?jsonBasic"))
+            .await
+            .unwrap();
+
+        firehose_tx.send(chat_message("12345", "hello")).unwrap();
+
+        let line = next_text(&mut raw).await;
+        assert!(line.starts_with('@'), "{line}");
+        assert!(
+            line.ends_with(":some-user!some-user@some-user.kick.com PRIVMSG #xqc :hello"),
+            "{line}"
+        );
+
+        let basic: serde_json::Value = serde_json::from_str(&next_text(&mut json).await).unwrap();
+        assert_eq!(basic["text"], "hello");
+        assert_eq!(basic["channel"], "xqc");
+        assert_eq!(basic["displayName"], "Some_User");
+        assert_eq!(basic["tags"]["user-id"], "12345");
+
+        // messages arrive in the order they were sent
+        firehose_tx.send(chat_message("12345", "one")).unwrap();
+        firehose_tx.send(chat_message("12345", "two")).unwrap();
+        assert!(next_text(&mut raw).await.ends_with(":one"));
+        assert!(next_text(&mut raw).await.ends_with(":two"));
+
+        // when the server shuts down, it shuts down with a firehose client connected, and the
+        // clients are told that the connection is closed
+        shutdown_tx.send(()).unwrap();
+        let end = timeout(Duration::from_secs(5), raw.next())
+            .await
+            .expect("the client was not told that the server is shutting down");
+        assert!(matches!(end, Some(Ok(Message::Close(_)))), "{end:?}");
+        timeout(Duration::from_secs(5), server)
+            .await
+            .expect("the server did not shut down with a firehose client connected")
+            .unwrap();
+    }
 }

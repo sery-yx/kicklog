@@ -225,7 +225,7 @@ impl Bot {
         let mut retrying = false;
 
         loop {
-            let entries = Vec::from_iter(self.app.config.channels.read().unwrap().iter().cloned());
+            let entries = Vec::from_iter(self.app.channels.read().unwrap().iter().cloned());
             if let Some(capacity) = self.pusher.capacity() {
                 if entries.len() > capacity {
                     warn!(
@@ -317,10 +317,10 @@ impl Bot {
         summary
     }
 
-    /// Whether the config lists the channel, by id or by name. The entries of the config are
+    /// Whether the channel is one of the logged ones, by id or by name. The entries are
     /// lowercase, and names with an underscore may be written with a hyphen in the slug.
     fn is_configured(&self, channel_id: &str, channel_login: &str) -> bool {
-        let configured = self.app.config.channels.read().unwrap();
+        let configured = self.app.channels.read().unwrap();
 
         configured.contains(channel_id)
             || configured.contains(channel_login)
@@ -403,7 +403,7 @@ impl Bot {
         let opted_out = |moderator: &Option<UserRef>| {
             moderator
                 .as_ref()
-                .is_some_and(|moderator| self.app.config.opt_out.contains_key(moderator.id.as_str()))
+                .is_some_and(|moderator| self.app.optout_users.contains(moderator.id.as_str()))
         };
 
         match event {
@@ -453,10 +453,13 @@ impl Bot {
         // Nothing about a user who opted out is logged: neither their messages, nor what
         // moderators did to them (this includes their deleted messages)
         let user_id = convert::subject_user_id(&message);
-        if !user_id.is_empty() && self.app.config.opt_out.contains_key(user_id) {
+        if !user_id.is_empty() && self.app.optout_users.contains(user_id) {
             return Ok(());
         }
 
+        // Only what is logged goes to the firehose. It is an error to send when nobody listens,
+        // which is the usual case.
+        self.app.firehose_tx.send(message.clone()).ok();
         self.writer_tx.send(message).await?;
 
         Ok(())
@@ -530,30 +533,11 @@ impl Bot {
             .get_channels_by_entries(entries.clone(), false)
             .await?;
 
-        {
-            let mut config_channels = self.app.config.channels.write().unwrap();
-
-            match action {
-                ChannelAction::Join => config_channels.extend(resolved.keys().cloned()),
-                ChannelAction::Part => {
-                    for (channel_id, channel_login) in &resolved {
-                        // The config may list the channel by its id or by its name
-                        config_channels.remove(channel_id);
-                        config_channels.remove(channel_login);
-                        config_channels.remove(&channel_login.replace('-', "_"));
-                    }
-                    // What was asked for is removed even if Kick does not know the channel
-                    // anymore, which is the case for deleted accounts
-                    for entry in &entries {
-                        config_channels.remove(entry);
-                    }
-                }
-            }
-        }
-        // The channels are joined and left even if the config cannot be written, but the
+        // The channels are joined and left even if the database cannot be written, but the
         // change would be lost when the bot is restarted
-        if let Err(err) = self.app.config.save() {
-            error!("Could not save the config: {err:#}");
+        let stored = stored_entries(action, &resolved, &entries);
+        if let Err(err) = self.app.update_channels(&stored, action).await {
+            error!("Could not save the channels: {err:#}");
         }
 
         for (channel_id, channel_login) in &resolved {
@@ -709,10 +693,40 @@ impl Bot {
     }
 }
 
-#[derive(Clone, Copy)]
-enum ChannelAction {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChannelAction {
     Join,
     Part,
+}
+
+/// The entries of the logged channels which a request to join or leave channels changes.
+/// `resolved` is what Kick knows of the channels (user id -> slug), `entries` what was asked for.
+///
+/// Joining stores the ids. Leaving removes every form a channel may be stored in, as the id, as
+/// the slug, or with `_` where the slug has `-`, and what was asked for even if Kick does not
+/// know the channel anymore (which is the case for deleted accounts).
+fn stored_entries(
+    action: ChannelAction,
+    resolved: &HashMap<String, String>,
+    entries: &[String],
+) -> Vec<String> {
+    let mut stored: Vec<String> = match action {
+        ChannelAction::Join => resolved.keys().cloned().collect(),
+        ChannelAction::Part => {
+            let mut stored = Vec::new();
+            for (channel_id, channel_login) in resolved {
+                stored.push(channel_id.clone());
+                stored.push(channel_login.clone());
+                stored.push(channel_login.replace('-', "_"));
+            }
+            stored.extend(entries.iter().cloned());
+            stored
+        }
+    };
+    stored.sort();
+    stored.dedup();
+
+    stored
 }
 
 /// The wait before the next attempt, which doubles with every failed attempt
@@ -805,6 +819,141 @@ mod tests {
         assert!(capacity.is::<CapacityReached>());
         assert!(!other.is::<CapacityReached>());
         assert!(capacity.to_string().contains("300000"));
+    }
+
+    fn tag<'a>(message: &'a StructuredMessage<'_>, name: &str) -> Option<&'a str> {
+        message
+            .extra_tags
+            .iter()
+            .find(|(tag, _)| tag == name)
+            .map(|(_, value)| &**value)
+    }
+
+    #[tokio::test]
+    async fn logged_messages_reach_the_firehose_and_the_writer_but_not_opt_outs() {
+        let app = App::for_tests("127.0.0.1:0");
+        let mut firehose_rx = app.firehose_tx.subscribe();
+
+        let (writer_tx, mut writer_rx) = mpsc::channel(16);
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let (pusher, pusher_task) = pusher::spawn(
+            PusherConfig {
+                key: "key".to_owned(),
+                cluster: "us2".to_owned(),
+                max_channels_per_connection: 90,
+                max_connections: None,
+                new_connection_every: Duration::from_secs(2),
+            },
+            event_tx,
+            shutdown_rx,
+        );
+        let bot = Bot {
+            app: app.clone(),
+            writer_tx,
+            pusher,
+            state: Arc::new(BotState::default()),
+        };
+        let channel = ChannelRef {
+            id: "676".to_owned(),
+            login: "xqc".to_owned(),
+        };
+
+        let chat = |user_id: u64, text: &str| {
+            let data = serde_json::json!({
+                "id": "21d47bf1-1486-4228-b4c7-420fe65e40b0",
+                "content": text,
+                "type": "message",
+                "created_at": "2026-10-02T06:38:02+00:00",
+                "sender": {
+                    "id": user_id, "username": "Some_User", "slug": "some-user",
+                    "identity": {"color": "#BC66FF", "badges": []}
+                }
+            });
+            events::parse_event(events::CHAT_MESSAGE_EVENT, &data).unwrap()
+        };
+        let ban = |user_id: u64, moderator_id: u64| {
+            let data = serde_json::json!({
+                "id": "77777777-7777-4777-8777-777777777777",
+                "user": {"id": user_id, "username": "Target", "slug": "target"},
+                "banned_by": {"id": moderator_id, "username": "Mod", "slug": "mod"},
+                "permanent": true
+            });
+            events::parse_event(events::USER_BANNED_EVENT, &data).unwrap()
+        };
+
+        // a message is logged, and goes to the firehose
+        bot.write_event(&channel, &chat(12345, "hello"))
+            .await
+            .unwrap();
+        let logged = writer_rx.try_recv().unwrap();
+        let fired = firehose_rx.try_recv().unwrap();
+        assert_eq!(logged.text, "hello");
+        assert_eq!(logged.user_id, "12345");
+        assert_eq!(logged, fired);
+
+        // nothing about a user who opted out is logged or sent to the firehose: neither
+        // their messages, nor what moderators do to them
+        app.optout_users.insert("12345".to_owned());
+        bot.write_event(&channel, &chat(12345, "secret"))
+            .await
+            .unwrap();
+        bot.write_event(&channel, &ban(12345, 20)).await.unwrap();
+        assert!(writer_rx.try_recv().is_err());
+        assert!(firehose_rx.try_recv().is_err());
+
+        // somebody else is still logged...
+        bot.write_event(&channel, &chat(777, "still here"))
+            .await
+            .unwrap();
+        assert_eq!(writer_rx.try_recv().unwrap().text, "still here");
+        assert_eq!(firehose_rx.try_recv().unwrap().text, "still here");
+
+        // ...and a moderator who opted out is not named in what they did
+        bot.write_event(&channel, &ban(10, 20)).await.unwrap();
+        let named = writer_rx.try_recv().unwrap();
+        assert_eq!(tag(&named, "moderator-user-id"), Some("20"));
+        app.optout_users.insert("20".to_owned());
+        bot.write_event(&channel, &ban(10, 20)).await.unwrap();
+        let hidden = writer_rx.try_recv().unwrap();
+        assert_eq!(
+            hidden.message_type,
+            crate::db::schema::MessageType::ClearChat
+        );
+        assert_eq!(tag(&hidden, "target-user-id"), Some("10"));
+        assert_eq!(tag(&hidden, "moderator-user-id"), None);
+        assert_eq!(tag(&hidden, "moderator-user-login"), None);
+        assert_eq!(firehose_rx.try_recv().unwrap(), named);
+        assert_eq!(firehose_rx.try_recv().unwrap(), hidden);
+
+        pusher_task.abort();
+    }
+
+    #[test]
+    fn joining_stores_the_ids() {
+        let resolved = HashMap::from([("676".to_owned(), "xqc".to_owned())]);
+
+        assert_eq!(
+            stored_entries(ChannelAction::Join, &resolved, &["xqc".to_owned()]),
+            vec!["676"]
+        );
+    }
+
+    #[test]
+    fn leaving_removes_every_form_a_channel_may_be_stored_in() {
+        let resolved = HashMap::from([("1".to_owned(), "some-user".to_owned())]);
+        let entries = vec!["some_user".to_owned(), "999".to_owned()];
+
+        assert_eq!(
+            stored_entries(ChannelAction::Part, &resolved, &entries),
+            vec!["1", "999", "some-user", "some_user"]
+        );
+
+        // deleted accounts are not known to Kick, what was asked for is removed anyway
+        assert_eq!(
+            stored_entries(ChannelAction::Part, &HashMap::new(), &["999".to_owned()]),
+            vec!["999"]
+        );
     }
 
     #[test]

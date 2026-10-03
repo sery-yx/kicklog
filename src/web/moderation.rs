@@ -35,7 +35,7 @@ use axum::{
     Json,
 };
 use chrono::Utc;
-use dashmap::DashMap;
+use dashmap::DashSet;
 
 const DEFAULT_BANS_LIMIT: u64 = 100;
 const DEFAULT_FEED_LIMIT: u64 = 50;
@@ -76,7 +76,7 @@ pub async fn get_user_channel_bans(
     let entries = moderation::history(actions, Utc::now());
     let banned = !moderation::channels_with_active_punishment(&entries).is_empty();
     let totals = Totals::of(&entries);
-    let actions = page(entries, &params, &app.config.opt_out);
+    let actions = page(entries, &params, &app.optout_users);
 
     Ok((
         cache_header(CURRENT_CACHE_SECONDS),
@@ -109,7 +109,7 @@ pub async fn get_user_bans(
     check_user_not_opted_out(&app, &user_id)?;
 
     // Channels which opted out are not listed
-    let excluded = opted_out_ids(&app.config.opt_out);
+    let excluded = opted_out_ids(&app.optout_users);
     // One row more than is used, to know whether there are more
     let mut actions = moderation_db::get_user_punishment_actions(
         &app.db,
@@ -136,7 +136,7 @@ pub async fn get_user_bans(
         })
         .collect();
     let totals = Totals::of(&entries);
-    let actions = page(entries, &params, &app.config.opt_out);
+    let actions = page(entries, &params, &app.optout_users);
 
     Ok((
         cache_header(CURRENT_CACHE_SECONDS),
@@ -196,7 +196,7 @@ pub async fn get_channel_moderation(
     let offset = params.offset.unwrap_or(0);
 
     // Actions about users who opted out are left out
-    let excluded = opted_out_ids(&app.config.opt_out);
+    let excluded = opted_out_ids(&app.optout_users);
     let filter = ChannelActionsFilter {
         kind: params.kind,
         moderator_id: moderator_id.as_deref(),
@@ -219,7 +219,7 @@ pub async fn get_channel_moderation(
         .filter(|login| !login.is_empty());
     let actions = actions
         .into_iter()
-        .map(|action| action_response(HistoryEntry { action, end: None }, &app.config.opt_out))
+        .map(|action| action_response(HistoryEntry { action, end: None }, &app.optout_users))
         .collect();
 
     Ok((
@@ -248,7 +248,7 @@ pub async fn get_channel_moderators(
     let limit = clamp_limit(params.limit, DEFAULT_LIMIT);
 
     // Moderators who opted out are not listed
-    let excluded = opted_out_ids(&app.config.opt_out);
+    let excluded = opted_out_ids(&app.optout_users);
     let stats =
         moderation_db::get_moderator_stats(&app.db, &channel_id, range, limit, &excluded).await?;
 
@@ -307,8 +307,8 @@ fn clamp_entries(limit: Option<u64>, default: u64) -> u64 {
 
 /// A user named in a moderation action, if there is one. Nobody is named who opted out: Kick
 /// shows who moderators are, but they have the right not to be in these logs.
-fn person(id: &str, login: &str, opt_out: &DashMap<String, bool>) -> Option<ModerationPerson> {
-    if id.is_empty() || opt_out.contains_key(id) {
+fn person(id: &str, login: &str, opt_out: &DashSet<String>) -> Option<ModerationPerson> {
+    if id.is_empty() || opt_out.contains(id) {
         return None;
     }
 
@@ -318,10 +318,7 @@ fn person(id: &str, login: &str, opt_out: &DashMap<String, bool>) -> Option<Mode
     })
 }
 
-fn action_response(
-    entry: HistoryEntry,
-    opt_out: &DashMap<String, bool>,
-) -> ModerationActionResponse {
+fn action_response(entry: HistoryEntry, opt_out: &DashSet<String>) -> ModerationActionResponse {
     let HistoryEntry { action, end } = entry;
     let kind = action.kind;
 
@@ -371,7 +368,7 @@ impl Totals {
 fn page(
     mut entries: Vec<HistoryEntry>,
     params: &BansParams,
-    opt_out: &DashMap<String, bool>,
+    opt_out: &DashSet<String>,
 ) -> Vec<ModerationActionResponse> {
     if params.order == SortOrder::Desc {
         entries.reverse();
@@ -431,14 +428,14 @@ mod tests {
 
     #[test]
     fn nobody_is_named_who_opted_out() {
-        let opt_out: DashMap<String, bool> = DashMap::new();
+        let opt_out: DashSet<String> = DashSet::new();
         assert_eq!(
             person("20", "mod", &opt_out).map(|person| person.id),
             Some("20".to_owned())
         );
         assert!(person("", "mod", &opt_out).is_none());
 
-        opt_out.insert("20".to_owned(), true);
+        opt_out.insert("20".to_owned());
         assert!(person("20", "mod", &opt_out).is_none());
     }
 
@@ -459,7 +456,7 @@ mod tests {
                     moderator_login: "unbanner".to_owned(),
                 }),
             },
-            &DashMap::new(),
+            &DashSet::new(),
         );
 
         assert_eq!(
@@ -490,7 +487,7 @@ mod tests {
             ..action(100, ModerationKind::Ban)
         };
 
-        let response = serde_json::to_value(action_response(entry(ban), &DashMap::new())).unwrap();
+        let response = serde_json::to_value(action_response(entry(ban), &DashSet::new())).unwrap();
 
         assert_eq!(response["type"], "ban");
         assert!(response.get("moderator").is_none());
@@ -505,7 +502,7 @@ mod tests {
             ..action(100, ModerationKind::Unban)
         };
 
-        let response = serde_json::to_value(action_response(entry(unban), &DashMap::new())).unwrap();
+        let response = serde_json::to_value(action_response(entry(unban), &DashSet::new())).unwrap();
 
         assert_eq!(response["type"], "unban");
         assert_eq!(response["permanent"], true);
@@ -523,7 +520,7 @@ mod tests {
             ..action(100, ModerationKind::Delete)
         };
 
-        let response = serde_json::to_value(action_response(entry(deleted), &DashMap::new())).unwrap();
+        let response = serde_json::to_value(action_response(entry(deleted), &DashSet::new())).unwrap();
 
         assert_eq!(response["type"], "delete");
         assert_eq!(response["messageId"], "c52ca12d-3cd1-4471-80ed-2cf73bac96a1");
@@ -543,7 +540,7 @@ mod tests {
             ..action(100, ModerationKind::Clear)
         };
 
-        let response = serde_json::to_value(action_response(entry(clear), &DashMap::new())).unwrap();
+        let response = serde_json::to_value(action_response(entry(clear), &DashSet::new())).unwrap();
 
         assert_eq!(
             response,
@@ -558,8 +555,8 @@ mod tests {
 
     #[test]
     fn a_moderator_who_opted_out_is_not_named() {
-        let opt_out: DashMap<String, bool> = DashMap::new();
-        opt_out.insert("20".to_owned(), true);
+        let opt_out: DashSet<String> = DashSet::new();
+        opt_out.insert("20".to_owned());
 
         let response = action_response(entry(action(100, ModerationKind::Ban)), &opt_out);
 
@@ -586,7 +583,7 @@ mod tests {
             offset: Some(1),
         };
         assert_eq!(
-            timestamps(page(entries.clone(), &newest_first, &DashMap::new())),
+            timestamps(page(entries.clone(), &newest_first, &DashSet::new())),
             vec![400, 300]
         );
 
@@ -596,7 +593,7 @@ mod tests {
             offset: None,
         };
         assert_eq!(
-            timestamps(page(entries.clone(), &oldest_first, &DashMap::new())),
+            timestamps(page(entries.clone(), &oldest_first, &DashSet::new())),
             vec![100, 200]
         );
 
@@ -606,7 +603,7 @@ mod tests {
             limit: None,
             offset: Some(10),
         };
-        assert_eq!(timestamps(page(entries, &beyond, &DashMap::new())), Vec::<i64>::new());
+        assert_eq!(timestamps(page(entries, &beyond, &DashSet::new())), Vec::<i64>::new());
     }
 
     #[test]

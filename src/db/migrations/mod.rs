@@ -3,18 +3,22 @@ mod moderation;
 mod rollups;
 mod structured;
 mod username_history;
+mod users;
 
-use crate::Result;
+use crate::{config::Config, Result};
 use clickhouse::Client;
 use moderation::ModerationActionsMigration;
 use rollups::{MessageCountsDailyMigration, UserChannelStatsMigration};
 use structured::StructuredMigration;
 use tracing::{debug, info};
 use username_history::UsernameHistoryMigration;
+use users::UserTablesMigration;
 
 use self::migratable::Migratable;
 
-pub async fn run(db: &Client, db_name: &str) -> Result<()> {
+pub async fn run(db: &Client, config: &Config) -> Result<()> {
+    let db_name = config.clickhouse_db.as_str();
+
     create_migrations_table(db).await?;
 
     run_migration(
@@ -105,6 +109,10 @@ ORDER BY channel_id",
 
     // The moderation endpoints (bans, timeouts, unbans, deleted messages), built the same way
     run_migration(db, "11_moderation_actions", ModerationActionsMigration).await?;
+
+    // The logged channels and the opt outs, which used to be stored in the config file. What an
+    // older config has is imported here.
+    run_migration(db, "12_user_tables", UserTablesMigration { config }).await?;
 
     Ok(())
 }

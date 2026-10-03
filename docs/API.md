@@ -40,8 +40,8 @@ Every endpoint which returns messages understands the same parameters (their pre
 | Parameter | Effect |
 |-----------|--------|
 | *(none)* | Plain text, one line per message: `[2026-10-02 06:38:02] #channel user: text` |
-| `json` | `{"messages": [...]}` with all details: `text`, `displayName`, `timestamp`, `id`, `tags`, `username`, `channel`, `raw` and `type` |
-| `jsonBasic` | The same without `username`, `channel`, `raw` and `type` |
+| `json` | `{"messages": [...]}` with all details: `text`, `displayName`, `channel`, `timestamp`, `id`, `tags`, `username`, `raw` and `type` |
+| `jsonBasic` | The same without `username`, `raw` and `type` (`channel`, the login of the channel, is part of it) |
 | `ndjson` | One JSON object (as in `jsonBasic`) per line |
 | `raw` | IRC style lines rebuilt from the stored data |
 | `reverse` | Newest messages first |
@@ -330,6 +330,21 @@ Deleted messages have `aiModerated` and `violatedRules` when Kick's AI moderatio
 
 The moderation lines of the [log endpoints](#logs) carry the same data as tags (`json` and `raw` formats): `moderator-user-id` and `moderator-user-login` for bans, timeouts and unbans, `ban-duration` (seconds) and `ban-expires-at` for timeouts, `ban-permanent=1` for bans (and for unbans of permanent bans), `target-user-id` for bans and timeouts, and `target-msg-id`, `ai-moderated` and `violated-rules` (plus `target-user-id`, if the author is known) for deleted messages. The text of these lines says who did it: `some-user has been timed out for 600 seconds by some-mod`.
 
+## Firehose
+
+`GET /firehose` is a websocket which sends every message that is logged, in all channels, as soon as it arrives. The server only sends, anything a client sends is ignored.
+
+| Parameter | Effect |
+|-----------|--------|
+| *(none)* | One text frame per message, an IRC style line as in the `raw` format |
+| `jsonBasic` | One text frame per message, the JSON object of the `jsonBasic` format (including `channel`) |
+
+```
+websocat "ws://localhost:8025/firehose?jsonBasic"
+```
+
+It carries what is logged: nothing about users who opted out, and moderators who opted out are not named. A client which cannot keep up (it falls about 1000 messages behind) is disconnected and has to connect again, messages are not queued for it any longer. When the server shuts down, the clients are sent a close frame. `/capabilities` lists `firehose`, and the metric `rustlog_firehose_clients_count` is the number of connected clients.
+
 ## Other endpoints
 
 | Endpoint | Description |
@@ -346,7 +361,12 @@ Requests to `/admin/...` need the configured `adminAPIKey` in the `X-Api-Key` he
 |----------|-------------|
 | `POST /admin/channels` | Starts logging channels. Body: `{"channels": ["xqc", "7183419"]}`, each entry a slug or a user id |
 | `DELETE /admin/channels` | Stops logging channels, same body. Ids of channels which Kick does not know anymore (deleted accounts) are removed as well |
+| `POST /admin/check-users` | Tells which users have logged messages in a channel. Body: `{"channel": "676", "users": ["12345", "67890"]}` (user ids, the channel by its user id). Answers `[{"user": "12345", "has_logs": true}, ...]` in the order the users were given. Opt outs are not taken into account |
+
+The channels which are logged are stored in the database, see [CONFIG.md](./CONFIG.md#channels-and-opt-outs).
 
 ## Opting out
 
-`POST /optout` returns a code which is valid for 60 seconds. Sending `!rustlog optout <code>` in a logged chat opts the sender out: their messages are no longer logged and their logs are no longer served. Admins can opt out other users with `!rustlog optout <name>`.
+`POST /optout` returns a code which is valid for 60 seconds. Sending `!rustlog optout <code>` in a logged chat opts the sender out: their messages are no longer logged and their logs are no longer served. Admins can opt out other users with `!rustlog optout <name>`. The opt outs are stored in the database.
+
+Requests for the logs of a channel or a user who opted out are answered with status 403 and the header `X-Opt-Out: true`, so that they can be told from other refusals.

@@ -5,8 +5,7 @@
 //! Twitch IRC connection.
 //!
 //! The chatrooms are spread over several websocket connections ("shards"), the way the IRC
-//! library of the original rustlog (`twitch-irc`, configured with `ClientConfig::new_simple`)
-//! spreads channels over IRC connections:
+//! library of rustlog (`twitch-irc`) spreads channels over IRC connections:
 //!
 //! - a connection carries up to [`DEFAULT_CHANNELS_PER_CONNECTION`] chatrooms, a new connection
 //!   is opened when all existing ones are full,
@@ -14,8 +13,9 @@
 //! - connections are opened one at a time, a new one is started at most every
 //!   [`DEFAULT_NEW_CONNECTION_EVERY_MS`] milliseconds.
 //!
-//! These are the limits of the original, they are the defaults so that this port behaves the
-//! same. All of them can be changed in the config.
+//! The defaults are those of the ByteZ1337 fork of rustlog: 400 channels per connection (the
+//! original rustlog has 90), no limit on the connections and a new connection every 2 seconds.
+//! All of them can be changed in the config.
 
 use crate::ShutdownRx;
 use futures::{SinkExt, StreamExt};
@@ -34,8 +34,9 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, trace, warn};
 
 /// How many chatrooms are subscribed on a single websocket connection by default.
-/// The original rustlog gets this value from its IRC library (`max_channels_per_connection`).
-pub const DEFAULT_CHANNELS_PER_CONNECTION: usize = 90;
+/// This is the value of the ByteZ1337 fork of rustlog (`max_channels_per_connection: 400`),
+/// the original rustlog gets 90 from its IRC library.
+pub const DEFAULT_CHANNELS_PER_CONNECTION: usize = 400;
 /// How long to wait after a connection was started before the next one may be started, by
 /// default. The original rustlog gets this value from its IRC library (`new_connection_every`).
 pub const DEFAULT_NEW_CONNECTION_EVERY_MS: u64 = 2000;
@@ -795,15 +796,15 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_those_of_the_original_rustlog() {
-        // `ClientConfig::new_simple` of twitch-irc, which the original rustlog uses:
-        // `max_channels_per_connection: 90` and `new_connection_every: 2 seconds`,
-        // without a limit on the number of connections
-        assert_eq!(DEFAULT_CHANNELS_PER_CONNECTION, 90);
+    fn defaults_are_those_of_the_bytez1337_fork() {
+        // The ByteZ1337 fork of rustlog configures twitch-irc with
+        // `max_channels_per_connection: 400` (the original has 90) and
+        // `new_connection_every: 2 seconds`, without a limit on the number of connections
+        assert_eq!(DEFAULT_CHANNELS_PER_CONNECTION, 400);
         assert_eq!(DEFAULT_NEW_CONNECTION_EVERY_MS, 2000);
 
         let defaults = config();
-        assert_eq!(defaults.max_channels_per_connection, 90);
+        assert_eq!(defaults.max_channels_per_connection, 400);
         assert_eq!(defaults.max_connections, None);
         assert_eq!(defaults.capacity(), None);
         assert_eq!(defaults.new_connection_every, Duration::from_secs(2));

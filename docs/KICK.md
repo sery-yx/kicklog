@@ -25,7 +25,7 @@ A Kick channel has three different ids. Only the first one is used by rustlog-ki
 
 ### Finding ids
 
-You normally do not need ids: the `channels` list in the config, the admin API and the `!rustlog join` chat command accept **slugs as well as user ids**. To look up the id of a logged channel, use `GET /channels`, which lists the name and `userID` of every channel. For other channels, Kick's website API shows it: `https://kick.com/api/v2/channels/<slug>` contains `user_id`.
+You normally do not need ids: the `channels` list of the config (imported on the first start, see [CONFIG.md](./CONFIG.md#channels-and-opt-outs)), the admin API and the `!rustlog join` chat command accept **slugs as well as user ids**. To look up the id of a logged channel, use `GET /channels`, which lists the name and `userID` of every channel. For other channels, Kick's website API shows it: `https://kick.com/api/v2/channels/<slug>` contains `user_id`.
 
 ## Chatroom ids
 
@@ -110,19 +110,19 @@ Messages sent while rustlog is disconnected from Kick are lost, as there is no w
 
 ### Join limits
 
-The join limits are the same as in the original rustlog, whose IRC library (`twitch-irc`, `ClientConfig::new_simple`) uses these values. The websocket connections are managed the same way:
+The join limits are those of the [ByteZ1337 fork of rustlog](https://github.com/ByteZ1337/rustlog), which configures its IRC library (`twitch-irc`) with them. The only difference to the original rustlog is the number of channels per connection, which is 400 here and in the fork (the original has 90). The websocket connections are managed the way the IRC connections are:
 
 | Limit | Default | Option |
 |-------|---------|--------|
-| channels per connection | 90 | `pusherMaxChannelsPerConnection` |
+| channels per connection | 400 | `pusherMaxChannelsPerConnection` |
 | number of connections | not limited | `pusherMaxConnections` |
 | time between opening two connections | a new connection is started at most every 2 seconds, one at a time | `pusherNewConnectionEveryMs` |
 
 A new connection is opened when all existing ones carry as many channels as allowed. A connection is closed when its last channel is left, and a connection which was lost is opened again (which counts as opening a connection, so the pacing applies to reconnects too). Connections are opened one at a time: a connection keeps its turn until it is established, and the next one is started the configured time after that. If connecting fails, the next one may start right away.
 
-The pacing means that a large number of channels takes a while to join: 90 channels per 2 seconds, so about 2 minutes for 5 000 channels and about 37 minutes for 100 000. Chat is logged from the moment a connection is up, there is no need to wait for the others.
+The pacing means that a large number of channels takes a while to join: 400 channels per 2 seconds, so about half a minute for 5 000 channels and about 8 minutes for 100 000 (the lookups of the chatrooms of channels which are joined for the first time take longer, see below). Chat is logged from the moment a connection is up, there is no need to wait for the others.
 
-The options exist so that the limits can be changed later without touching the code. For example, more channels per connection (`pusherMaxChannelsPerConnection`) need fewer connections and therefore fewer sockets, and `pusherNewConnectionEveryMs` makes large numbers of connections come up faster. Those would be changes to the defaults of the original rustlog, nothing of this is the default.
+The options exist so that the limits can be changed without touching the code. More channels per connection (`pusherMaxChannelsPerConnection`) need fewer connections and therefore fewer sockets, `pusherNewConnectionEveryMs` makes large numbers of connections come up faster. Pusher, the protocol of the websocket, does not limit how many channels one connection can subscribe to, but Kick's own limits are not documented: if subscriptions are refused (warnings like "could not subscribe to chatrooms.…" in the log), lower `pusherMaxChannelsPerConnection`, for example to 90 which is the value of the original rustlog.
 
 ### Practical notes
 
@@ -137,7 +137,7 @@ The leaderboards, ranks, channel activity and user channel lists (see [API.md](.
 - `message_counts_daily`: chat messages per channel, user and day,
 - `user_channel_stats`: first message, last message and message count per user and channel.
 
-When rustlog starts on a database which already has messages, the rollups are built from them once (one partition at a time), which can take a while on large databases. They only count chat messages (`PRIVMSG`), not bans or notices. All periods are calendar periods in UTC, so the ClickHouse server has to run in UTC (the default of the official image).
+When rustlog starts on a database which already has messages, the rollups are built from them once (one partition at a time), which can take a while on large databases. They only count chat messages (`PRIVMSG`), not bans or notices. All periods are calendar periods in UTC, whatever time zone the ClickHouse server is set to: the days of the rollups, of the activity of a user and of the list of days with logs are worked out in UTC. (The rollups of a database which an earlier version built keep the days they were built with, which only makes a difference if its server is not set to UTC.)
 
 The rollups also contain the messages of users and channels which opted out (their logs are not deleted either, they are only not served). The statistics queries leave them out where they can (the totals of `/channels/top` still include the messages of users who opted out). As with the rollups, stop all instances of rustlog which use the database before upgrading to the first version which has them.
 

@@ -2,8 +2,9 @@ pub mod cache;
 
 use self::cache::UsersCache;
 use crate::{
+    bot::ChannelAction,
     config::Config,
-    db::{self, delete_user_logs, writer::FlushBuffer},
+    db::{self, delete_user_logs, schema::StructuredMessage, writer::FlushBuffer},
     error::Error,
     kick::api::{is_valid_slug, normalize_slug, KickApi, MAX_LOOKUP_BATCH},
     Result,
@@ -12,18 +13,26 @@ use anyhow::Context;
 use dashmap::DashSet;
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
+use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 #[derive(Clone)]
 pub struct App {
     pub kick: Arc<KickApi>,
     pub users: UsersCache,
+    /// The logged channels, as Kick user ids or channel slugs (the table `channel`). Use
+    /// `update_channels` to change them, that keeps the database up to date.
+    pub channels: Arc<RwLock<HashSet<String>>>,
     pub optout_codes: Arc<DashSet<String>>,
+    /// The ids of the users who opted out (the table `opt_out`)
+    pub optout_users: Arc<DashSet<String>>,
     pub db: Arc<clickhouse::Client>,
     pub config: Arc<Config>,
     pub flush_buffer: FlushBuffer,
+    /// Every message which is logged is also sent here, for the clients of the firehose
+    pub firehose_tx: broadcast::Sender<StructuredMessage<'static>>,
 }
 
 /// The result of looking up the channels which are going to be joined
@@ -325,32 +334,123 @@ impl App {
             .await
             .context("Could not delete logs")?;
 
-        self.config.opt_out.insert(user_id.to_owned(), true);
-        self.config.save()?;
+        // In effect right away, whether or not the database can be written
+        self.optout_users.insert(user_id.to_owned());
+        db::update_opt_out(&self.db, user_id, true)
+            .await
+            .context("Could not save the opt out")?;
         info!("User {user_id} opted out");
 
         Ok(())
     }
 
     pub fn check_opted_out(&self, channel_id: &str, user_id: Option<&str>) -> Result<()> {
-        if self.config.opt_out.contains_key(channel_id) {
+        if self.optout_users.contains(channel_id) {
             return Err(Error::ChannelOptedOut);
         }
 
         if let Some(user_id) = user_id {
-            if self.config.opt_out.contains_key(user_id) {
+            if self.optout_users.contains(user_id) {
                 return Err(Error::UserOptedOut);
             }
         }
 
         Ok(())
     }
+
+    /// Adds channels to the logged ones or removes them, in memory and in the database.
+    /// The channels are given the way they are stored: by id or by slug.
+    ///
+    /// The change is made in memory even if the database cannot be written, like it is
+    /// with a config file which cannot be written. The error says that the change
+    /// would be lost when the logger is restarted.
+    pub async fn update_channels(&self, channels: &[String], action: ChannelAction) -> Result<()> {
+        apply_channel_update(&mut self.channels.write().unwrap(), channels, action);
+
+        match action {
+            ChannelAction::Join => db::add_channels(&self.db, channels).await,
+            ChannelAction::Part => db::remove_channels(&self.db, channels).await,
+        }
+    }
+}
+
+#[cfg(test)]
+impl App {
+    /// An `App` for tests, which does not connect to anything: ClickHouse is only connected to
+    /// when a query is made. `listen_address` is where `web::run` listens.
+    pub(crate) fn for_tests(listen_address: &str) -> App {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "clickhouseUrl": "http://127.0.0.1:1",
+            "clickhouseDb": "test",
+            "clientID": "id",
+            "clientSecret": "secret",
+            "admins": [],
+            "listenAddress": listen_address,
+            "adminAPIKey": "test-key",
+        }))
+        .expect("a valid config");
+
+        App {
+            kick: Arc::new(KickApi::new("id".to_owned(), "secret".to_owned()).unwrap()),
+            users: UsersCache::default(),
+            channels: Arc::default(),
+            optout_codes: Arc::default(),
+            optout_users: Arc::default(),
+            db: Arc::new(clickhouse::Client::default().with_url("http://127.0.0.1:1")),
+            config: Arc::new(config),
+            flush_buffer: FlushBuffer::default(),
+            firehose_tx: broadcast::channel(16).0,
+        }
+    }
+}
+
+fn apply_channel_update(logged: &mut HashSet<String>, channels: &[String], action: ChannelAction) {
+    for channel in channels {
+        match action {
+            ChannelAction::Join => {
+                logged.insert(channel.clone());
+            }
+            ChannelAction::Part => {
+                logged.remove(channel);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::split_ids_and_names;
+    use super::{apply_channel_update, split_ids_and_names};
+    use crate::bot::ChannelAction;
     use pretty_assertions::assert_eq;
+    use std::collections::HashSet;
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn channels_are_added_and_removed() {
+        let mut logged: HashSet<String> = strings(&["676", "xqc"]).into_iter().collect();
+
+        apply_channel_update(
+            &mut logged,
+            &strings(&["7183419", "xqc"]),
+            ChannelAction::Join,
+        );
+        let mut sorted: Vec<&String> = logged.iter().collect();
+        sorted.sort();
+        assert_eq!(sorted, vec!["676", "7183419", "xqc"]);
+
+        // names which are not logged are ignored
+        apply_channel_update(
+            &mut logged,
+            &strings(&["676", "nobody"]),
+            ChannelAction::Part,
+        );
+        let mut sorted: Vec<&String> = logged.iter().collect();
+        sorted.sort();
+        assert_eq!(sorted, vec!["7183419", "xqc"]);
+    }
 
     #[test]
     fn splits_ids_from_names() {

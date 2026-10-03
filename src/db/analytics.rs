@@ -228,7 +228,8 @@ pub async fn get_user_activity(
         messages: u64,
     }
 
-    let bucket = bucket_expression(interval, "toDate(timestamp)");
+    // The day in UTC, like the days of the rollup `message_counts_daily` are
+    let bucket = bucket_expression(interval, "toDate(toTimeZone(timestamp, 'UTC'))");
     let query = format!("SELECT toString({bucket}) AS bucket, count() AS messages FROM message_structured WHERE channel_id = ? AND user_id = ? AND message_type = {CHAT_MESSAGE_TYPE} AND timestamp >= ? AND timestamp < ? GROUP BY bucket ORDER BY bucket ASC");
     let rows = db
         .query(&query)
@@ -466,6 +467,17 @@ mod tests {
         assert_eq!(
             bucket_expression(Interval::Year, "date"),
             "toStartOfYear(date)"
+        );
+    }
+
+    #[test]
+    fn activity_of_a_user_is_grouped_by_the_day_in_utc() {
+        // The expression `get_user_activity` passes, which has to agree with the days of the
+        // rollup (see `daily_counts_select`)
+        let day = "toDate(toTimeZone(timestamp, 'UTC'))";
+        assert_eq!(
+            bucket_expression(Interval::Week, day),
+            "toStartOfWeek(toDate(toTimeZone(timestamp, 'UTC')), 1)"
         );
     }
 

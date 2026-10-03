@@ -196,6 +196,15 @@ pub struct PreviousName {
     pub first_timestamp: DateTime<Utc>,
 }
 
+/// Whether a user has logged messages in a channel
+#[derive(Serialize, JsonSchema, Debug, PartialEq, Eq)]
+pub struct UserHasLogs {
+    /// Kick user id
+    pub user: String,
+    /// Whether the user has logs in the channel
+    pub has_logs: bool,
+}
+
 /// Path of the endpoints which are about a user in general and not about a channel
 #[derive(Deserialize, JsonSchema)]
 pub struct UserPathParams {

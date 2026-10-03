@@ -1,8 +1,8 @@
 //! Calendar periods and intervals used by the leaderboard and activity endpoints.
 //!
 //! All periods are calendar periods in UTC: a week starts on Monday, a month on the first day
-//! of the month. The ClickHouse server is expected to run in UTC (the default of the official
-//! image), like it is for the rest of rustlog.
+//! of the month. The queries work out days in UTC themselves, the time zone of the ClickHouse
+//! server does not matter.
 
 use chrono::{DateTime, Datelike, Days, Months, NaiveDate, NaiveTime, Utc};
 use schemars::JsonSchema;

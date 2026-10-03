@@ -642,6 +642,20 @@ fn extract_message_text(mut message_text: &str) -> &str {
     message_text
 }
 
+/// A logged channel, as stored in the table `channel`. The value is what was configured for it:
+/// a Kick user id, or a channel slug for entries which were never resolved to an id.
+#[derive(Row, Serialize)]
+pub struct Channel {
+    pub channel_id: String,
+}
+
+/// Whether a user opted out, as stored in the table `opt_out`
+#[derive(Row, Serialize)]
+pub struct OptOut {
+    pub user_id: String,
+    pub state: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{MessageType, StructuredMessage, UnstructuredMessage};

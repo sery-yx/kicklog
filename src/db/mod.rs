@@ -15,13 +15,14 @@ use crate::{
         schema::LogRangeParams,
         stream::{FlushBufferResponse, LogsStream},
     },
-    web::schema::{AvailableLogDate, LogsParams, PreviousName, UserLogsStats},
+    web::schema::{AvailableLogDate, LogsParams, PreviousName, UserHasLogs, UserLogsStats},
     Result,
 };
 use chrono::{DateTime, Datelike, Duration, Utc};
 use clickhouse::{query::RowCursor, Client, Row};
+use dashmap::DashSet;
 use rand::{rng, seq::IteratorRandom};
-use schema::StructuredMessage;
+use schema::{Channel, StructuredMessage};
 use tracing::debug;
 
 const CHANNEL_MULTI_QUERY_SIZE_DAYS: i64 = 14;
@@ -139,7 +140,7 @@ pub async fn read_available_channel_logs(
 ) -> Result<Vec<AvailableLogDate>> {
     let timestamps: Vec<i32> = db
         .query(
-            "SELECT toDateTime(toStartOfDay(timestamp)) AS date FROM message_structured WHERE channel_id = ? GROUP BY date ORDER BY date DESC",
+            "SELECT toDateTime(toStartOfDay(timestamp, 'UTC'), 'UTC') AS date FROM message_structured WHERE channel_id = ? GROUP BY date ORDER BY date DESC",
         )
         .bind(channel_id)
         .fetch_all().await?;
@@ -166,7 +167,7 @@ pub async fn read_available_user_logs(
     user_id: &str,
 ) -> Result<Vec<AvailableLogDate>> {
     let timestamps: Vec<i32> = db
-        .query("SELECT toDateTime(toStartOfMonth(timestamp)) AS date FROM message_structured WHERE channel_id = ? AND user_id = ? GROUP BY date ORDER BY date DESC")
+        .query("SELECT toDateTime(toStartOfMonth(timestamp, 'UTC'), 'UTC') AS date FROM message_structured WHERE channel_id = ? AND user_id = ? GROUP BY date ORDER BY date DESC")
         .bind(channel_id)
         .bind(user_id)
         .fetch_all().await?;
@@ -419,6 +420,105 @@ pub async fn get_user_name_history(db: &Client, user_id: &str) -> Result<Vec<Pre
 
 /// How many ids are looked up in a single query
 const LOOKUP_CHUNK_SIZE: usize = 500;
+
+/// Reads the logged channels (Kick user ids, or slugs which were never resolved to an id)
+pub async fn read_channels(db: &Client) -> Result<HashSet<String>> {
+    let channels = db
+        .query("SELECT channel_id FROM channel")
+        .fetch_all::<String>()
+        .await?;
+
+    Ok(HashSet::from_iter(channels))
+}
+
+/// Remembers channels as logged
+pub async fn add_channels(db: &Client, channels: &[String]) -> Result<()> {
+    if channels.is_empty() {
+        return Ok(());
+    }
+
+    let mut insert = db.insert("channel")?;
+    for channel_id in channels {
+        insert
+            .write(&Channel {
+                channel_id: channel_id.clone(),
+            })
+            .await?;
+    }
+    insert.end().await?;
+
+    Ok(())
+}
+
+/// Forgets channels which were logged
+pub async fn remove_channels(db: &Client, channels: &[String]) -> Result<()> {
+    for chunk in channels.chunks(100) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let mut query = db.query(&format!(
+            "DELETE FROM channel WHERE channel_id IN ({placeholders})"
+        ));
+        for channel_id in chunk {
+            query = query.bind(channel_id);
+        }
+        query.execute().await?;
+    }
+
+    Ok(())
+}
+
+/// Reads the ids of the users who opted out. `FINAL` returns only the latest state of each user.
+pub async fn read_opt_outs(db: &Client) -> Result<DashSet<String>> {
+    let opt_outs = db
+        .query("SELECT user_id FROM opt_out FINAL WHERE state")
+        .fetch_all::<String>()
+        .await?;
+
+    Ok(DashSet::from_iter(opt_outs))
+}
+
+pub async fn update_opt_out(db: &Client, user_id: &str, state: bool) -> Result<()> {
+    db.query("INSERT INTO opt_out (user_id, state) VALUES (?, ?)")
+        .bind(user_id)
+        .bind(state)
+        .execute()
+        .await?;
+
+    Ok(())
+}
+
+/// Tells which of the users have logged messages in a channel, in the order they were given in.
+/// Opt outs are not taken into account.
+pub async fn check_users_exist(
+    db: &Client,
+    channel_id: &str,
+    user_ids: &[String],
+) -> Result<Vec<UserHasLogs>> {
+    let mut with_logs: HashSet<String> = HashSet::new();
+
+    for chunk in user_ids.chunks(LOOKUP_CHUNK_SIZE) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let mut query = db
+            .query(&format!(
+                "SELECT user_id FROM message_structured WHERE channel_id = ? AND user_id IN ({placeholders}) GROUP BY user_id"
+            ))
+            .bind(channel_id);
+        for user_id in chunk {
+            query = query.bind(user_id);
+        }
+
+        with_logs.extend(query.fetch_all::<String>().await?);
+    }
+
+    let mut seen = HashSet::new();
+    Ok(user_ids
+        .iter()
+        .filter(|user_id| seen.insert(user_id.as_str()))
+        .map(|user_id| UserHasLogs {
+            user: user_id.clone(),
+            has_logs: with_logs.contains(user_id),
+        })
+        .collect())
+}
 
 /// The chatroom a Kick channel's chat is published under
 #[derive(Row, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

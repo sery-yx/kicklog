@@ -120,7 +120,7 @@ fn clickhouse_flush_interval() -> u64 {
 }
 
 fn default_pusher_key() -> String {
-    String::from("32cbd69e4b950bf97679")
+    String::from("34bf7a0ff419a2a775b9")
 }
 
 fn default_pusher_cluster() -> String {
@@ -176,7 +176,7 @@ mod tests {
         assert_eq!(config.admin_api_key, None);
         assert!(config.legacy_opt_out.is_empty());
         assert!(config.chatroom_ids.is_empty());
-        assert_eq!(config.pusher_key, "32cbd69e4b950bf97679");
+        assert_eq!(config.pusher_key, "34bf7a0ff419a2a775b9");
         assert_eq!(config.pusher_cluster, "us2");
         assert!(config.legacy_channels.contains("676"));
     }

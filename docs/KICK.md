@@ -6,7 +6,17 @@ Rustlog-kick behaves like the Twitch version of rustlog (same HTTP API, same web
 
 Kick has no IRC. Its web client receives chat over a [Pusher](https://pusher.com/docs/channels/library_auth_reference/pusher-websockets-protocol/) websocket, and every chat is published on a public channel named `chatrooms.<chatroom id>.v2`. Listening needs no account, so rustlog-kick joins chats anonymously, like the Twitch version does with IRC.
 
-This is not an official API. Kick's official API only offers webhooks for chat events, which need a public HTTPS endpoint and are limited to 1000 channels for unverified apps. The websocket is what every Kick chat tool uses and has been stable for years, but Kick may change it without notice. The Pusher key and cluster can be changed in the config if that happens.
+This is not an official API. Kick's official API only offers webhooks for chat events, which need a public HTTPS endpoint and are limited to 1000 channels for unverified apps. The websocket is what every Kick chat tool uses, but Kick may change it without notice. The Pusher key and cluster can be changed in the config if that happens (`pusherKey`, `pusherCluster`).
+
+Kick has changed the key before, and its web client no longer has the key built in: it asks an endpoint for the connection details. If chat stops being logged and the log shows a Pusher error with code 4001 (`App key ... not in this cluster`), look up the current key:
+
+```
+curl -s -H "Content-Type: application/json" \
+  -d '{"client":{"id":"00000000-0000-4000-8000-000000000000","type":"web"},"capabilities":{"accepted_providers":[{"provider":"pusher"}]}}' \
+  https://web.kick.com/api/v1/realtime/channels/668/chat/connection
+```
+
+`app_key` and `cluster` in the answer are the values for `pusherKey` and `pusherCluster`. The `668` is the channel id of any channel, and the request has to list only `pusher` as accepted provider: if it also lists `centrifugo`, Kick answers with that and leaves Pusher out. Kick's web client prefers Centrifugo now, so Pusher may be switched off at some point, rustlog-kick does not speak Centrifugo yet.
 
 The official API is used for what it is good at: turning slugs into user ids and back (with an app access token, see [CONFIG.md](./CONFIG.md#creating-a-kick-app)).
 

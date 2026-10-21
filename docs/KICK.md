@@ -6,17 +6,24 @@ Rustlog-kick behaves like the Twitch version of rustlog (same HTTP API, same web
 
 Kick has no IRC. Its web client receives chat over a [Pusher](https://pusher.com/docs/channels/library_auth_reference/pusher-websockets-protocol/) websocket, and every chat is published on a public channel named `chatrooms.<chatroom id>.v2`. Listening needs no account, so rustlog-kick joins chats anonymously, like the Twitch version does with IRC.
 
-This is not an official API. Kick's official API only offers webhooks for chat events, which need a public HTTPS endpoint and are limited to 1000 channels for unverified apps. The websocket is what every Kick chat tool uses, but Kick may change it without notice. The Pusher key and cluster can be changed in the config if that happens (`pusherKey`, `pusherCluster`).
+This is not an official API. Kick's official API only offers webhooks for chat events, which need a public HTTPS endpoint and are limited to 1000 channels for unverified apps. The websocket is what every Kick chat tool uses, but Kick may change it without notice.
 
-Kick has changed the key before, and its web client no longer has the key built in: it asks an endpoint for the connection details. If chat stops being logged and the log shows a Pusher error with code 4001 (`App key ... not in this cluster`), look up the current key:
+### The Pusher key
+
+Kick replaces its Pusher key every now and then (the key that earlier versions came with is rejected by now), and its web client does not have the key built in: it asks an endpoint for the connection details. Rustlog-kick does the same, so it follows the key by itself:
+
+1. At startup it asks `POST https://web.kick.com/api/v1/realtime/connection` for the key and cluster (with the request through `curl` as a fallback, like the other lookups on Kick's website). If that fails, it starts with the key this version comes with.
+2. When Kick rejects the key of a connection (Pusher error 4001, `App key ... not in this cluster`), the connections ask again, at most once a minute for all of them together, and reconnect with the new key.
+
+Setting `pusherKey` or `pusherCluster` in the config to something other than the defaults (`34bf7a0ff419a2a775b9` and `us2`) turns this off, the values of the config are used as they are. To look up the current key by hand:
 
 ```
 curl -s -H "Content-Type: application/json" \
   -d '{"client":{"id":"00000000-0000-4000-8000-000000000000","type":"web"},"capabilities":{"accepted_providers":[{"provider":"pusher"}]}}' \
-  https://web.kick.com/api/v1/realtime/channels/668/chat/connection
+  https://web.kick.com/api/v1/realtime/connection
 ```
 
-`app_key` and `cluster` in the answer are the values for `pusherKey` and `pusherCluster`. The `668` is the channel id of any channel, and the request has to list only `pusher` as accepted provider: if it also lists `centrifugo`, Kick answers with that and leaves Pusher out. Kick's web client prefers Centrifugo now, so Pusher may be switched off at some point, rustlog-kick does not speak Centrifugo yet.
+`app_key` and `cluster` in the answer are the key and the cluster. The request has to list only `pusher` as accepted provider: if it also lists `centrifugo` (which is what Kick's web client sends), Kick answers with that and leaves Pusher out. Kick's web client prefers Centrifugo now, so Pusher may be switched off at some point. Rustlog-kick does not speak Centrifugo yet, and then logs that Kick does not offer a Pusher connection.
 
 The official API is used for what it is good at: turning slugs into user ids and back (with an app access token, see [CONFIG.md](./CONFIG.md#creating-a-kick-app)).
 

@@ -1,4 +1,6 @@
-use crate::kick::pusher::{DEFAULT_CHANNELS_PER_CONNECTION, DEFAULT_NEW_CONNECTION_EVERY_MS};
+use crate::kick::pusher::{
+    Credentials, DEFAULT_CHANNELS_PER_CONNECTION, DEFAULT_NEW_CONNECTION_EVERY_MS,
+};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -99,7 +101,37 @@ impl Config {
         self.pusher_max_connections
             .filter(|max_connections| *max_connections > 0)
     }
+
+    /// Whether the config leaves the Pusher key and cluster as they are by default. Then the
+    /// key is looked up on Kick's website, because Kick replaces it every now and then. A key
+    /// which was set in the config is used as it is.
+    pub fn uses_default_pusher_credentials(&self) -> bool {
+        let default_key = is_default_pusher_key(&self.pusher_key)
+            || RETIRED_PUSHER_KEYS.contains(&self.pusher_key.as_str());
+
+        default_key && is_default_pusher_cluster(&self.pusher_cluster)
+    }
+
+    /// The Pusher key and cluster to use when nothing better is found: the ones from the
+    /// config, or the ones this version comes with if the config has the defaults.
+    pub fn pusher_credentials(&self) -> Credentials {
+        if self.uses_default_pusher_credentials() {
+            Credentials {
+                key: default_pusher_key(),
+                cluster: default_pusher_cluster(),
+            }
+        } else {
+            Credentials {
+                key: self.pusher_key.clone(),
+                cluster: self.pusher_cluster.clone(),
+            }
+        }
+    }
 }
+
+/// Keys Kick has replaced. A config which still has one is treated like one with the default,
+/// for example when the key was copied into it from the documentation of an older version.
+const RETIRED_PUSHER_KEYS: &[&str] = &["32cbd69e4b950bf97679"];
 
 /// Channels are listed by id or by name. Names are not case sensitive, so they are compared
 /// in lowercase everywhere.
@@ -287,6 +319,55 @@ mod tests {
         assert_eq!(saved["clientSecret"], "secret");
         assert_eq!(saved["admins"][0], "someone");
         assert_eq!(saved["adminAPIKey"], "key");
+    }
+
+    fn config_with_pusher(key: &str, cluster: &str) -> Config {
+        serde_json::from_str(&format!(
+            r#"{{
+                "clickhouseUrl": "http://localhost:8123",
+                "clickhouseDb": "rustlog",
+                "clientID": "id",
+                "clientSecret": "secret",
+                "admins": [],
+                "pusherKey": "{key}",
+                "pusherCluster": "{cluster}"
+            }}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_default_pusher_key_is_looked_up_on_kick() {
+        let config: Config = serde_json::from_str(MINIMAL).unwrap();
+
+        assert!(config.uses_default_pusher_credentials());
+        assert_eq!(
+            config.pusher_credentials(),
+            Credentials {
+                key: "34bf7a0ff419a2a775b9".to_owned(),
+                cluster: "us2".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn a_pusher_key_of_the_config_is_used_as_it_is() {
+        let config = config_with_pusher("other", "us2");
+        assert!(!config.uses_default_pusher_credentials());
+        assert_eq!(config.pusher_credentials().key, "other");
+
+        let config = config_with_pusher("34bf7a0ff419a2a775b9", "eu");
+        assert!(!config.uses_default_pusher_credentials());
+        assert_eq!(config.pusher_credentials().key, "34bf7a0ff419a2a775b9");
+        assert_eq!(config.pusher_credentials().cluster, "eu");
+    }
+
+    #[test]
+    fn a_key_which_kick_has_replaced_counts_as_the_default() {
+        let config = config_with_pusher("32cbd69e4b950bf97679", "us2");
+
+        assert!(config.uses_default_pusher_credentials());
+        assert_eq!(config.pusher_credentials().key, "34bf7a0ff419a2a775b9");
     }
 
     #[test]

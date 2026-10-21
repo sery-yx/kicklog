@@ -6,9 +6,12 @@
 //!   is needed to subscribe to its chat. The official API does not expose it. The website API is
 //!   protected by Cloudflare, so a request which fails is repeated through `curl`, whose TLS
 //!   fingerprint is usually let through.
+//! * The realtime endpoint of the website API (`web.kick.com/api/v1/realtime`) is where Kick's
+//!   web client gets the Pusher key from, which Kick replaces every now and then.
 
+use super::pusher::Credentials;
 use reqwest::{header, Client, StatusCode};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::{process::Command, sync::Mutex, time::sleep};
@@ -17,6 +20,12 @@ use tracing::{debug, info, warn};
 const API_BASE_URL: &str = "https://api.kick.com";
 const OAUTH_BASE_URL: &str = "https://id.kick.com";
 const WEB_BASE_URL: &str = "https://kick.com";
+const REALTIME_CONNECTION_URL: &str = "https://web.kick.com/api/v1/realtime/connection";
+/// Kick's web client sends an id of its own. The id is only used to tie a token to a client for
+/// the providers which need one, and Pusher does not.
+const REALTIME_CLIENT_ID: &str = "00000000-0000-4000-8000-000000000000";
+/// The longest key or cluster name that is accepted
+const MAX_CREDENTIAL_LENGTH: usize = 64;
 const API_USER_AGENT: &str = concat!("rustlog-kick/", env!("CARGO_PKG_VERSION"));
 /// The website API only answers requests which look like they come from a browser
 const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36";
@@ -284,6 +293,55 @@ impl KickApi {
         parse_web_channel(&body)
     }
 
+    /// Asks Kick which Pusher key and cluster its chat uses at the moment.
+    ///
+    /// The request lists Pusher as the only provider that is accepted. Kick's web client
+    /// accepts Centrifugo as well, and when it does, Kick answers with that and leaves Pusher out.
+    pub async fn pusher_credentials(&self) -> Result<Credentials, KickError> {
+        let request = json!({
+            "client": {"id": REALTIME_CLIENT_ID, "type": "web"},
+            "capabilities": {"accepted_providers": [{"provider": "pusher"}]},
+        });
+
+        let body = match self.web_post(REALTIME_CONNECTION_URL, &request).await {
+            Ok(body) => body,
+            Err(err) => {
+                debug!("Request to {REALTIME_CONNECTION_URL} failed ({err}), retrying with curl");
+                let request_text = request.to_string();
+                curl_json(REALTIME_CONNECTION_URL, Some(request_text.as_str()))
+                    .await
+                    .map_err(|curl_err| {
+                        KickError::Other(format!("{err}; trying again with curl: {curl_err}"))
+                    })?
+            }
+        };
+
+        parse_pusher_credentials(&body)
+    }
+
+    async fn web_post(&self, url: &str, body: &Value) -> Result<Value, KickError> {
+        let response = self
+            .http
+            .post(url)
+            .header(header::USER_AGENT, BROWSER_USER_AGENT)
+            .header(header::ACCEPT, "application/json")
+            .header(header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+            .json(body)
+            .send()
+            .await?;
+        let status = response.status();
+        let text = response.text().await?;
+        if !status.is_success() {
+            return Err(KickError::Status {
+                url: url.to_owned(),
+                status: status.as_u16(),
+                body: truncate(&text),
+            });
+        }
+
+        serde_json::from_str(&text).map_err(|err| KickError::Response(format!("{url}: {err}")))
+    }
+
     async fn web_get(&self, url: &str) -> Result<Value, KickError> {
         let response = self
             .http
@@ -309,24 +367,35 @@ impl KickApi {
 
 /// Fetches a JSON document by running the `curl` binary
 async fn fetch_with_curl(url: &str) -> Result<Value, KickError> {
-    let output = Command::new("curl")
-        .args([
-            // Has to be the first argument. Ignores the user's .curlrc, which could change the
-            // output in ways this function does not expect.
-            "--disable",
-            "--silent",
-            "--show-error",
-            "--location",
-            "--max-time",
-            "20",
-            "--user-agent",
-            BROWSER_USER_AGENT,
-            "--header",
-            "Accept: application/json",
-            "--write-out",
-            "\n%{http_code}",
-            url,
-        ])
+    curl_json(url, None).await
+}
+
+/// Fetches a JSON document by running the `curl` binary. With a body, the request is a POST
+/// of that JSON document.
+async fn curl_json(url: &str, post_body: Option<&str>) -> Result<Value, KickError> {
+    let mut command = Command::new("curl");
+    command.args([
+        // Has to be the first argument. Ignores the user's .curlrc, which could change the
+        // output in ways this function does not expect.
+        "--disable",
+        "--silent",
+        "--show-error",
+        "--location",
+        "--max-time",
+        "20",
+        "--user-agent",
+        BROWSER_USER_AGENT,
+        "--header",
+        "Accept: application/json",
+        "--write-out",
+        "\n%{http_code}",
+    ]);
+    if let Some(body) = post_body {
+        command.args(["--header", "Content-Type: application/json", "--data-binary", body]);
+    }
+
+    let output = command
+        .arg(url)
         .kill_on_drop(true)
         .output()
         .await
@@ -441,6 +510,47 @@ fn parse_web_channel(body: &Value) -> Result<WebChannel, KickError> {
     })
 }
 
+/// Finds the Pusher key and cluster in the answer of the realtime endpoint:
+/// `{"data": {"connections": [{"provider": "pusher", "credentials": {"app_key": "...", "cluster": "..."}}]}}`
+fn parse_pusher_credentials(body: &Value) -> Result<Credentials, KickError> {
+    let connections = body
+        .get("data")
+        .and_then(|data| data.get("connections"))
+        .and_then(|connections| connections.as_array())
+        .ok_or_else(|| KickError::Response("the answer has no list of connections".to_owned()))?;
+
+    connections
+        .iter()
+        .find_map(|connection| {
+            if connection.get("provider")?.as_str()? != "pusher" {
+                return None;
+            }
+            let credentials = connection.get("credentials")?;
+            let key = credentials.get("app_key")?.as_str()?.trim();
+            let cluster = credentials.get("cluster")?.as_str()?.trim();
+
+            // Both end up in the address of the websocket
+            (is_credential(key) && is_credential(cluster)).then(|| Credentials {
+                key: key.to_owned(),
+                cluster: cluster.to_owned(),
+            })
+        })
+        .ok_or_else(|| {
+            KickError::Response(
+                "Kick does not offer a Pusher connection (it may have switched to another provider)"
+                    .to_owned(),
+            )
+        })
+}
+
+fn is_credential(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_CREDENTIAL_LENGTH
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 fn value_to_id(value: Option<&Value>) -> Option<String> {
     match value? {
         Value::Number(id) => Some(id.to_string()),
@@ -474,6 +584,83 @@ mod tests {
     #[test]
     fn slugs_are_normalized() {
         assert_eq!(normalize_slug("  XQc "), "xqc");
+    }
+
+    #[test]
+    fn parses_the_pusher_credentials_of_the_realtime_endpoint() {
+        // as Kick answers it (October 2026)
+        let body = json!({
+            "data": {
+                "connections": [
+                    {"credentials": {"app_key": "34bf7a0ff419a2a775b9", "cluster": "us2"}, "provider": "pusher"}
+                ],
+                "mode": "websocket"
+            },
+            "message": "success"
+        });
+
+        assert_eq!(
+            parse_pusher_credentials(&body).unwrap(),
+            Credentials {
+                key: "34bf7a0ff419a2a775b9".to_owned(),
+                cluster: "us2".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn finds_pusher_among_other_providers() {
+        let body = json!({
+            "data": {"connections": [
+                {"credentials": {"url": "wss://realtime.us-east-1.platform.kick.com/connection/websocket"}, "provider": "centrifugo"},
+                {"credentials": {"app_key": "abc123", "cluster": "eu"}, "provider": "pusher"}
+            ]}
+        });
+
+        let credentials = parse_pusher_credentials(&body).unwrap();
+        assert_eq!(credentials.key, "abc123");
+        assert_eq!(credentials.cluster, "eu");
+    }
+
+    #[test]
+    fn answers_without_pusher_are_errors() {
+        // Kick answers like this when the request accepts Centrifugo
+        let centrifugo_only = json!({
+            "data": {"connections": [
+                {"credentials": {"url": "wss://realtime.us-east-1.platform.kick.com/connection/websocket"}, "provider": "centrifugo"}
+            ]}
+        });
+        assert!(parse_pusher_credentials(&centrifugo_only).is_err());
+
+        assert!(parse_pusher_credentials(&json!({"data": {"connections": []}})).is_err());
+        assert!(parse_pusher_credentials(&json!({"data": {}})).is_err());
+        assert!(parse_pusher_credentials(&json!({})).is_err());
+        assert!(parse_pusher_credentials(&json!("<html>")).is_err());
+    }
+
+    #[test]
+    fn credentials_which_do_not_belong_in_an_address_are_refused() {
+        let too_long = "a".repeat(MAX_CREDENTIAL_LENGTH + 1);
+
+        for (key, cluster) in [
+            ("", "us2"),
+            ("abc123", ""),
+            ("abc/123", "us2"),
+            ("abc123", "us2.example.com"),
+            ("abc123", "us2#"),
+            ("abc 123", "us2"),
+            (too_long.as_str(), "us2"),
+        ] {
+            let body = json!({
+                "data": {"connections": [
+                    {"credentials": {"app_key": key, "cluster": cluster}, "provider": "pusher"}
+                ]}
+            });
+            assert!(
+                parse_pusher_credentials(&body).is_err(),
+                "{key:?} / {cluster:?} should have been refused"
+            );
+        }
     }
 
     #[test]

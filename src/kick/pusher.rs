@@ -22,6 +22,8 @@ use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
@@ -54,10 +56,111 @@ const STABLE_CONNECTION: Duration = Duration::from_secs(60);
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
 const PING_FRAME: &str = r#"{"event":"pusher:ping","data":{}}"#;
 const PONG_FRAME: &str = r#"{"event":"pusher:pong","data":{}}"#;
+/// Pusher's error code for an application key it does not know. This is what Kick's key turns
+/// into when Kick replaces it.
+const UNKNOWN_APPLICATION_CODE: u64 = 4001;
+/// The key is looked up at most this often, however many connections are rejected
+const MIN_CREDENTIALS_LOOKUP_INTERVAL: Duration = Duration::from_secs(60);
+/// The lookup makes a request and may repeat it through curl, which are 20 seconds each
+const CREDENTIALS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// What it takes to reach Kick's Pusher application
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Credentials {
+    /// Pusher application key of Kick's web client
+    pub key: String,
+    pub cluster: String,
+}
+
+impl Credentials {
+    pub fn url(&self) -> String {
+        format!(
+            "wss://ws-{}.pusher.com/app/{}?protocol=7&client=js&version=8.4.0-rc2&flash=false",
+            self.cluster, self.key
+        )
+    }
+}
+
+/// The future of a lookup of the credentials, `None` if they could not be found
+pub type CredentialsFuture = Pin<Box<dyn Future<Output = Option<Credentials>> + Send>>;
+/// Finds the credentials Kick uses at the moment. It is asked for them when Kick rejects the
+/// ones in use, because Kick replaces its key every now and then.
+pub type CredentialsSource = Arc<dyn Fn() -> CredentialsFuture + Send + Sync>;
+
+/// The credentials all connections use. When Kick turns one down because of its key, the
+/// connections ask for new ones through the source, one lookup for all of them.
+struct SharedCredentials {
+    source: Option<CredentialsSource>,
+    /// The credentials in use, and a generation that goes up whenever they are replaced, so that
+    /// a connection can tell whether the credentials it was rejected with are still the current
+    /// ones. Never held across an await point, reading it does not wait for a lookup.
+    current: std::sync::Mutex<(Credentials, u64)>,
+    /// One lookup at a time. Holds the time of the last lookup.
+    lookup: Mutex<Option<Instant>>,
+}
+
+impl SharedCredentials {
+    fn new(current: Credentials, source: Option<CredentialsSource>) -> Self {
+        Self {
+            source,
+            current: std::sync::Mutex::new((current, 0)),
+            lookup: Mutex::new(None),
+        }
+    }
+
+    /// The credentials to connect with, and the generation they belong to
+    fn current(&self) -> (Credentials, u64) {
+        self.current
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// A connection was turned down because of the credentials of the given generation.
+    /// Returns whether there are different credentials to try now.
+    ///
+    /// Only one connection looks them up. The ones which are rejected at the same moment wait
+    /// for that lookup and then find the new credentials in place.
+    async fn replace_rejected(&self, rejected_generation: u64) -> bool {
+        let mut last_lookup = self.lookup.lock().await;
+        if self.current().1 != rejected_generation {
+            return true;
+        }
+
+        let Some(source) = &self.source else {
+            return false;
+        };
+        if last_lookup.is_some_and(|at| at.elapsed() < MIN_CREDENTIALS_LOOKUP_INTERVAL) {
+            return false;
+        }
+        *last_lookup = Some(Instant::now());
+
+        // A lookup which hangs must not hold up the connections which wait for it
+        let found = timeout(CREDENTIALS_LOOKUP_TIMEOUT, source())
+            .await
+            .unwrap_or(None);
+        let Some(found) = found else {
+            return false;
+        };
+
+        let mut current = self
+            .current
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if found == current.0 {
+            warn!("Kick still names the Pusher key which it rejects");
+            return false;
+        }
+
+        info!("Kick uses a different Pusher key now, switching to it");
+        *current = (found, current.1 + 1);
+        true
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PusherConfig {
-    /// Pusher application key of Kick's web client
+    /// Pusher application key of Kick's web client, to start with
     pub key: String,
     pub cluster: String,
     /// How many chatrooms are subscribed on a single websocket connection
@@ -69,11 +172,11 @@ pub struct PusherConfig {
 }
 
 impl PusherConfig {
-    pub fn url(&self) -> String {
-        format!(
-            "wss://ws-{}.pusher.com/app/{}?protocol=7&client=js&version=8.4.0-rc2&flash=false",
-            self.cluster, self.key
-        )
+    pub fn credentials(&self) -> Credentials {
+        Credentials {
+            key: self.key.clone(),
+            cluster: self.cluster.clone(),
+        }
     }
 
     /// The number of chatrooms that can be listened to at the same time, `None` if there is
@@ -145,8 +248,12 @@ impl PusherHandle {
 }
 
 /// Starts the connection manager. Events from all subscribed chatrooms are sent to `event_tx`.
-pub fn spawn(
+///
+/// The key in `config` is the one to start with. When Kick rejects it, `source` (if there is one)
+/// is asked for the key which is current and the connections carry on with that.
+pub fn spawn_with_source(
     config: PusherConfig,
+    source: Option<CredentialsSource>,
     event_tx: mpsc::Sender<PusherEvent>,
     shutdown_rx: ShutdownRx,
 ) -> (PusherHandle, JoinHandle<()>) {
@@ -165,7 +272,14 @@ pub fn spawn(
     }
 
     let (command_tx, command_rx) = mpsc::unbounded_channel();
-    let task = tokio::spawn(run_manager(config, command_rx, event_tx, shutdown_rx));
+    let credentials = Arc::new(SharedCredentials::new(config.credentials(), source));
+    let task = tokio::spawn(run_manager(
+        config,
+        credentials,
+        command_rx,
+        event_tx,
+        shutdown_rx,
+    ));
 
     (
         PusherHandle {
@@ -378,6 +492,7 @@ async fn await_turn<'a>(
 
 async fn run_manager(
     config: PusherConfig,
+    credentials: Arc<SharedCredentials>,
     mut command_rx: mpsc::UnboundedReceiver<PusherCommand>,
     event_tx: mpsc::Sender<PusherEvent>,
     mut shutdown_rx: ShutdownRx,
@@ -408,7 +523,7 @@ async fn run_manager(
                             let (shard_tx, shard_command_rx) = mpsc::unbounded_channel();
                             tasks.push(tokio::spawn(run_shard(
                                 connection,
-                                config.clone(),
+                                credentials.clone(),
                                 pacer.clone(),
                                 shard_command_rx,
                                 event_tx.clone(),
@@ -448,11 +563,13 @@ enum ConnectionEnd {
     /// There is nothing left to listen to
     Idle,
     Lost(String),
+    /// Kick does not know the application key of the connection
+    KeyRejected(String),
 }
 
 async fn run_shard(
     shard_id: usize,
-    config: Arc<PusherConfig>,
+    credentials: Arc<SharedCredentials>,
     pacer: Arc<ConnectionPacer>,
     mut command_rx: mpsc::UnboundedReceiver<ShardCommand>,
     event_tx: mpsc::Sender<PusherEvent>,
@@ -481,9 +598,11 @@ async fn run_shard(
                 Turn::Stop => return,
             };
 
+        // Read after the turn, the key may have been replaced while the connection waited
+        let (current, generation) = credentials.current();
         let end = run_connection(
             shard_id,
-            &config,
+            &current.url(),
             permit,
             &mut subscribed,
             &mut command_rx,
@@ -493,40 +612,54 @@ async fn run_shard(
         )
         .await;
 
-        match end {
+        let reason = match end {
             ConnectionEnd::Shutdown => return,
             ConnectionEnd::Idle => {
                 debug!("Pusher connection {shard_id} has no chatrooms left and was closed");
+                continue;
             }
-            ConnectionEnd::Lost(reason) => {
-                warn!(
-                    "Pusher connection {shard_id} was lost: {reason}. Reconnecting in {}s",
-                    backoff.as_secs()
-                );
-
-                // Keep applying subscription changes while waiting to reconnect.
-                // The jitter keeps all connections from reconnecting at the same moment
-                // after a network problem. It is computed in a statement of its own, the
-                // random number generator must not be held across an await point.
-                let jitter = Duration::from_millis(rand::random_range(
-                    0..=backoff.as_millis() as u64 / 2,
-                ));
-                let wait = sleep(backoff + jitter);
-                tokio::pin!(wait);
-                loop {
-                    tokio::select! {
-                        _ = &mut wait => break,
-                        command = command_rx.recv() => match command {
-                            Some(command) => apply_command(&mut subscribed, command),
-                            None => return,
-                        },
-                        _ = shutdown_rx.changed() => return,
-                    }
+            ConnectionEnd::Lost(reason) => reason,
+            ConnectionEnd::KeyRejected(reason) => {
+                // Stops waiting for the lookup when the program shuts down
+                let replaced = tokio::select! {
+                    replaced = credentials.replace_rejected(generation) => replaced,
+                    _ = shutdown_rx.changed() => return,
+                };
+                if replaced {
+                    // The pacer still spaces out the connections, there is no need to wait
+                    backoff = INITIAL_BACKOFF;
+                    continue;
                 }
+                // Retrying with the same key is pointless, so do it rarely
+                backoff = MAX_BACKOFF;
+                format!("Kick does not accept the Pusher key: {reason}")
+            }
+        };
 
-                backoff = (backoff * 2).min(MAX_BACKOFF);
+        warn!(
+            "Pusher connection {shard_id} was lost: {reason}. Reconnecting in {}s",
+            backoff.as_secs()
+        );
+
+        // Keep applying subscription changes while waiting to reconnect.
+        // The jitter keeps all connections from reconnecting at the same moment
+        // after a network problem. It is computed in a statement of its own, the
+        // random number generator must not be held across an await point.
+        let jitter = Duration::from_millis(rand::random_range(0..=backoff.as_millis() as u64 / 2));
+        let wait = sleep(backoff + jitter);
+        tokio::pin!(wait);
+        loop {
+            tokio::select! {
+                _ = &mut wait => break,
+                command = command_rx.recv() => match command {
+                    Some(command) => apply_command(&mut subscribed, command),
+                    None => return,
+                },
+                _ = shutdown_rx.changed() => return,
             }
         }
+
+        backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
 
@@ -543,7 +676,7 @@ fn apply_command(subscribed: &mut HashSet<u64>, command: ShardCommand) {
 
 async fn run_connection(
     shard_id: usize,
-    config: &PusherConfig,
+    url: &str,
     permit: ConnectionPermit<'_>,
     subscribed: &mut HashSet<u64>,
     command_rx: &mut mpsc::UnboundedReceiver<ShardCommand>,
@@ -551,11 +684,10 @@ async fn run_connection(
     shutdown_rx: &mut ShutdownRx,
     backoff: &mut Duration,
 ) -> ConnectionEnd {
-    let url = config.url();
     debug!("Pusher connection {shard_id} connecting");
 
     let mut ws = tokio::select! {
-        result = timeout(CONNECT_TIMEOUT, connect_async(url.as_str())) => match result {
+        result = timeout(CONNECT_TIMEOUT, connect_async(url)) => match result {
             Ok(Ok((ws, _response))) => ws,
             Ok(Err(err)) => return ConnectionEnd::Lost(format!("could not connect: {err}")),
             Err(_) => return ConnectionEnd::Lost("the connection attempt timed out".to_owned()),
@@ -588,11 +720,13 @@ async fn run_connection(
                 let text = match message {
                     Message::Text(text) => text,
                     Message::Close(frame) => {
+                        let code = frame.as_ref().map(|frame| u16::from(frame.code));
+                        if code == Some(UNKNOWN_APPLICATION_CODE as u16) {
+                            return ConnectionEnd::KeyRejected(format!("closed by the server ({frame:?})"));
+                        }
                         // 4000 to 4099 mean the server does not want us to reconnect with
-                        // the same settings (for example a wrong application key)
-                        let permanent = frame
-                            .as_ref()
-                            .is_some_and(|frame| (4000..4100).contains(&u16::from(frame.code)));
+                        // the same settings (for example a disabled application)
+                        let permanent = code.is_some_and(|code| (4000..4100).contains(&code));
                         if permanent {
                             *backoff = MAX_BACKOFF;
                         }
@@ -639,6 +773,10 @@ async fn run_connection(
                         }
                     }
                     Incoming::Error(error) => {
+                        if is_unknown_application(&error) {
+                            // The server closes the connection after this, no need to wait for it
+                            return ConnectionEnd::KeyRejected(error);
+                        }
                         warn!("Pusher connection {shard_id} received an error: {error}");
                     }
                     Incoming::SubscriptionSucceeded(channel) => {
@@ -760,6 +898,15 @@ fn parse_incoming(text: &str) -> Incoming {
     }
 }
 
+/// Whether the data of a `pusher:error` says that the application key is not known (or not
+/// known in this cluster)
+fn is_unknown_application(error: &str) -> bool {
+    serde_json::from_str::<Value>(error)
+        .ok()
+        .and_then(|error| error.get("code")?.as_u64())
+        == Some(UNKNOWN_APPLICATION_CODE)
+}
+
 /// The payload of Pusher frames is usually a JSON document encoded as a string
 fn decode_data(data: Option<&Value>) -> Value {
     match data {
@@ -775,6 +922,7 @@ fn decode_data(data: Option<&Value>) -> Value {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::watch;
 
     fn config() -> PusherConfig {
@@ -790,9 +938,132 @@ mod tests {
     #[test]
     fn builds_the_websocket_url() {
         assert_eq!(
-            config().url(),
+            config().credentials().url(),
             "wss://ws-us2.pusher.com/app/abc123?protocol=7&client=js&version=8.4.0-rc2&flash=false"
         );
+    }
+
+    fn credentials(key: &str) -> Credentials {
+        Credentials {
+            key: key.to_owned(),
+            cluster: "us2".to_owned(),
+        }
+    }
+
+    /// A source which finds the given credentials, and counts how often it is asked
+    fn source(calls: Arc<AtomicUsize>, found: Option<Credentials>) -> CredentialsSource {
+        Arc::new(move || -> CredentialsFuture {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let found = found.clone();
+            Box::pin(async move { found })
+        })
+    }
+
+    #[test]
+    fn unknown_application_errors_are_recognized() {
+        assert!(is_unknown_application(
+            r#"{"code":4001,"message":"App key abc not in this cluster. Did you forget to specify the cluster?"}"#
+        ));
+        assert!(!is_unknown_application(
+            r#"{"code":4200,"message":"Please reconnect immediately"}"#
+        ));
+        assert!(!is_unknown_application(
+            r#"could not subscribe to chatrooms.668.v2: {"type":"AuthError"}"#
+        ));
+        assert!(!is_unknown_application("null"));
+        assert!(!is_unknown_application(""));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rejected_key_is_replaced_by_the_one_the_source_finds() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let shared = SharedCredentials::new(
+            credentials("old"),
+            Some(source(calls.clone(), Some(credentials("new")))),
+        );
+
+        let (current, generation) = shared.current();
+        assert_eq!(current, credentials("old"));
+        assert_eq!(generation, 0);
+
+        assert!(shared.replace_rejected(generation).await);
+
+        let (current, generation) = shared.current();
+        assert_eq!(current, credentials("new"));
+        assert_eq!(generation, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connections_which_are_rejected_together_cause_one_lookup() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let shared = Arc::new(SharedCredentials::new(
+            credentials("old"),
+            Some(source(calls.clone(), Some(credentials("new")))),
+        ));
+
+        // three connections which all used the credentials of generation 0
+        let results = futures::future::join_all((0..3).map(|_| {
+            let shared = shared.clone();
+            async move { shared.replace_rejected(0).await }
+        }))
+        .await;
+
+        assert_eq!(results, vec![true, true, true]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(shared.current(), (credentials("new"), 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nothing_is_replaced_without_a_source() {
+        let shared = SharedCredentials::new(credentials("old"), None);
+
+        assert!(!shared.replace_rejected(0).await);
+        assert_eq!(shared.current(), (credentials("old"), 0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_lookup_keeps_the_key() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let shared = SharedCredentials::new(credentials("old"), Some(source(calls.clone(), None)));
+
+        assert!(!shared.replace_rejected(0).await);
+        assert_eq!(shared.current(), (credentials("old"), 0));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lookup_which_hangs_gives_up() {
+        let hanging: CredentialsSource = Arc::new(|| -> CredentialsFuture {
+            Box::pin(std::future::pending::<Option<Credentials>>())
+        });
+        let shared = SharedCredentials::new(credentials("old"), Some(hanging));
+        let start = Instant::now();
+
+        assert!(!shared.replace_rejected(0).await);
+
+        assert!(start.elapsed() >= CREDENTIALS_LOOKUP_TIMEOUT);
+        assert!(start.elapsed() < CREDENTIALS_LOOKUP_TIMEOUT + Duration::from_secs(1));
+        assert_eq!(shared.current(), (credentials("old"), 0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_source_is_asked_at_most_once_a_minute() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        // Kick still names the key which is rejected
+        let shared = SharedCredentials::new(
+            credentials("old"),
+            Some(source(calls.clone(), Some(credentials("old")))),
+        );
+
+        assert!(!shared.replace_rejected(0).await);
+        assert!(!shared.replace_rejected(0).await);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        sleep(MIN_CREDENTIALS_LOOKUP_INTERVAL).await;
+
+        assert!(!shared.replace_rejected(0).await);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

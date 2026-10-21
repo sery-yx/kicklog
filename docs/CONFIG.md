@@ -26,7 +26,7 @@ Kick specific options, all of them are optional:
 - `pusherMaxConnections` (number): How many websocket connections are opened at most. Not limited if unset or 0 (the default), like in the original rustlog. Operating systems commonly limit a process to 1024 open sockets, see [KICK.md](./KICK.md#scaling) for how the limits work together.
 - `pusherNewConnectionEveryMs` (number): Websocket connections are opened one at a time, and a new one is started at most this many milliseconds after the previous one was established. Defaults to 2000, like in the original rustlog.
 - `chatroomIds` (object of strings: numbers): Chatroom ids to use instead of looking them up, as `"<user id of the channel>": <chatroom id>`. Only needed if Kick's website cannot be reached from your server, see [KICK.md](./KICK.md#chatroom-ids).
-- `pusherKey` (string), `pusherCluster` (string): The credentials of the websocket Kick's web client uses. The defaults work, change them only if Kick changes them, see [KICK.md](./KICK.md#where-the-chat-comes-from) for how to look up the current ones.
+- `pusherKey` (string), `pusherCluster` (string): The credentials of the websocket Kick's web client uses. Leave them out: Kick replaces the key every now and then, so by default it is looked up on Kick's website at startup, and again if Kick rejects it, see [KICK.md](./KICK.md#the-pusher-key). A key or cluster here that differs from the defaults (`34bf7a0ff419a2a775b9` and `us2`) is used as it is, and the lookup is turned off. The key earlier versions came with counts as the default.
 
 ## Creating a Kick app
 

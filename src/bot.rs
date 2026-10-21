@@ -2,6 +2,7 @@ use crate::{
     app::App,
     db::{self, schema::StructuredMessage},
     kick::{
+        api::KickApi,
         convert::{self, ChannelRef, TimestampAssigner, ChatIndex},
         events::{self, KickEvent, UserRef},
         pusher::{self, PusherConfig, PusherEvent, PusherHandle},
@@ -37,6 +38,9 @@ const MAX_LOGGED_JOIN_FAILURES: usize = 20;
 const WEBSITE_LOOKUP_DELAY: Duration = Duration::from_millis(300);
 const EVENT_BUFFER_SIZE: usize = 10_000;
 const PUSHER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(4);
+/// The lookup of the Pusher key at startup makes a request and may repeat it through curl,
+/// which are 20 seconds each
+const PUSHER_KEY_LOOKUP_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Debug)]
 pub enum BotMessage {
@@ -70,14 +74,39 @@ pub async fn run(
     command_rx: Receiver<BotMessage>,
 ) {
     let (event_tx, event_rx) = mpsc::channel(EVENT_BUFFER_SIZE);
+
+    // Kick replaces its Pusher key every now and then, so unless the config sets one, the
+    // current key is asked for at the start and whenever Kick rejects the one in use
+    let look_up_key = app.config.uses_default_pusher_credentials();
+    let credentials = if look_up_key {
+        let found = match timeout(PUSHER_KEY_LOOKUP_TIMEOUT, app.kick.pusher_credentials()).await {
+            Ok(result) => result.map_err(|err| err.to_string()),
+            Err(_) => Err("the lookup timed out".to_owned()),
+        };
+        match found {
+            Ok(credentials) => credentials,
+            Err(reason) => {
+                warn!("Could not look up Kick's Pusher key ({reason}), starting with the one this version comes with");
+                app.config.pusher_credentials()
+            }
+        }
+    } else {
+        app.config.pusher_credentials()
+    };
     let pusher_config = PusherConfig {
-        key: app.config.pusher_key.clone(),
-        cluster: app.config.pusher_cluster.clone(),
+        key: credentials.key,
+        cluster: credentials.cluster,
         max_channels_per_connection: app.config.pusher_max_channels_per_connection,
         max_connections: app.config.pusher_connection_limit(),
         new_connection_every: Duration::from_millis(app.config.pusher_new_connection_every_ms),
     };
-    let (pusher, pusher_task) = pusher::spawn(pusher_config, event_tx, shutdown_rx.clone());
+    let credentials_source = look_up_key.then(|| pusher_credentials_source(app.kick.clone()));
+    let (pusher, pusher_task) = pusher::spawn_with_source(
+        pusher_config,
+        credentials_source,
+        event_tx,
+        shutdown_rx.clone(),
+    );
 
     let bot = Bot {
         app,
@@ -87,6 +116,22 @@ pub async fn run(
     };
     bot.run(shutdown_rx, command_rx, event_rx, pusher_task)
         .await;
+}
+
+/// How the connections ask for the Pusher key Kick uses at the moment
+fn pusher_credentials_source(kick: Arc<KickApi>) -> pusher::CredentialsSource {
+    Arc::new(move || -> pusher::CredentialsFuture {
+        let kick = kick.clone();
+        Box::pin(async move {
+            match kick.pusher_credentials().await {
+                Ok(credentials) => Some(credentials),
+                Err(err) => {
+                    warn!("Could not look up Kick's Pusher key: {err}");
+                    None
+                }
+            }
+        })
+    })
 }
 
 #[derive(Default)]
@@ -837,7 +882,7 @@ mod tests {
         let (writer_tx, mut writer_rx) = mpsc::channel(16);
         let (event_tx, _event_rx) = mpsc::channel(16);
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-        let (pusher, pusher_task) = pusher::spawn(
+        let (pusher, pusher_task) = pusher::spawn_with_source(
             PusherConfig {
                 key: "key".to_owned(),
                 cluster: "us2".to_owned(),
@@ -845,6 +890,7 @@ mod tests {
                 max_connections: None,
                 new_connection_every: Duration::from_secs(2),
             },
+            None,
             event_tx,
             shutdown_rx,
         );

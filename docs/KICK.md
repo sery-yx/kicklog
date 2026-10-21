@@ -8,6 +8,20 @@ Kick has no IRC. Its web client receives chat over a [Pusher](https://pusher.com
 
 This is not an official API. Kick's official API only offers webhooks for chat events, which need a public HTTPS endpoint and are limited to 1000 channels for unverified apps. The websocket is what every Kick chat tool uses, but Kick may change it without notice.
 
+### The Pusher channels
+
+Kick publishes things on three Pusher channels per channel, and rustlog-kick listens to all of them (the 400 channels per connection are chatrooms, so a connection carries up to three times as many Pusher channels, Kick accepted 1300 on one connection when this was tested):
+
+| Pusher channel | Events (names as Kick sends them) |
+|----------------|-----------------------------------|
+| `chatrooms.<chatroom id>.v2` | `App\Events\ChatMessageEvent`, `MessageDeletedEvent`, `UserBannedEvent`, `UserUnbannedEvent`, `ChatroomClearEvent`, `SubscriptionEvent`, `StreamHostEvent` |
+| `chatroom_<chatroom id>` | `RewardRedeemedEvent` (channel point rewards), `GiftedSubscriptionsEvent`, without the `App\Events\` prefix |
+| `channel_<channel id>` | `KicksGifted`, without the prefix |
+
+Each event is read from one channel only, so nothing is logged twice. The web client also listens for gifted subscriptions on `channel_<channel id>`, they are read from `chatroom_<chatroom id>`.
+
+The `<channel id>` of the last one is Kick's own id of the channel. It is neither the chatroom id nor the user id of the broadcaster (see [Ids and names](#ids-and-names)), and only the website API tells it. It is stored next to the chatroom id. For channels whose chatroom was stored by an older version, and for those in `chatroomIds`, it is looked up in the background after all channels are being listened to, at most once an hour per channel (about three lookups per second, so thousands of channels take hours), and a run of failed lookups ends the pass early; the channels which were not tried are tried by a later pass. The Kicks gifts of a channel are not logged until its id is known. When Kick's website cannot be reached from the server (the case `chatroomIds` is for), the id is never found and these gifts are not logged, there is no setting for the id.
+
 ### The Pusher key
 
 Kick replaces its Pusher key every now and then (the key that earlier versions came with is rejected by now), and its web client does not have the key built in: it asks an endpoint for the connection details. Rustlog-kick does the same, so it follows the key by itself:
@@ -29,13 +43,13 @@ The official API is used for what it is good at: turning slugs into user ids and
 
 ## Ids and names
 
-A Kick channel has three different ids. Only the first one is used by rustlog-kick:
+A Kick channel has three different ids. Only the first one is **rustlog's channel id**, the other two are needed to listen to the channel:
 
 | Id | Example (xQc) | Example (Amouranth) | Used for |
 |----|---------------|---------------------|----------|
 | user id of the broadcaster | `676` | `7183419` | **rustlog's channel id** and user id. Same id space as chatters (`sender.id`), the official API (`broadcaster_user_id`) and 7TV. |
-| channel id | `668` | `7088698` | not used |
-| chatroom id | `668` | `7022952` | subscribing to the websocket channel |
+| channel id | `668` | `7088698` | the Kicks gifts (`channel_<channel id>`, see [the Pusher channels](#the-pusher-channels)) |
+| chatroom id | `668` | `7022952` | the chat and the other events (`chatrooms.<chatroom id>.v2`, `chatroom_<chatroom id>`) |
 
 - The **login** of a user or channel is its **slug** (`some-user`), the **display name** is its username (`Some_User`). A slug is usually the lowercase username with `_` replaced by `-`, but not always, so rustlog always stores the slug Kick sends with the message.
 - In URLs both spellings work: `/channel/some_user` and `/channel/some-user` are looked up.
@@ -73,10 +87,10 @@ The value to put into `chatroomIds` is `chatroom.id` of that document, together 
 | ban / timeout | `CLEARCHAT` | `ban-duration` (seconds) and `ban-expires-at` for timeouts, `ban-permanent=1` for bans, `moderator-user-id` / `moderator-user-login` (who did it, if Kick says) |
 | chat cleared | `CLEARCHAT` | without a target |
 | unban | `USERNOTICE` (`msg-id=unban`) | `moderator-user-id` / `moderator-user-login` (who lifted it), `ban-permanent=1` if it was a permanent ban |
-| subscription, gifted subscriptions | `USERNOTICE` (`sub`, `resub`, `subgift`, `submysterygift`) | |
+| subscription, gifted subscriptions | `USERNOTICE` (`sub`, `resub`, `subgift`, `submysterygift`) | gifted subscriptions come from `chatroom_<chatroom id>`, see [the Pusher channels](#the-pusher-channels) |
 | host / raid | `USERNOTICE` (`msg-id=raid`) | |
-| channel point reward | `USERNOTICE` (`msg-id=reward-redeemed`) | |
-| KICKs gifted | `USERNOTICE` (`msg-id=kicks-gifted`) | |
+| channel point reward | `USERNOTICE` (`msg-id=reward-redeemed`) | from `chatroom_<chatroom id>` |
+| KICKs gifted | `USERNOTICE` (`msg-id=kicks-gifted`) | from `channel_<channel id>`, needs Kick's id of the channel |
 
 Messages are converted into the same model rustlog uses for Twitch, so the text, JSON, raw and ndjson formats work unchanged. The `raw` format is an IRC line rebuilt from the stored data (`:user!user@user.kick.com PRIVMSG #channel :text`), it exists for compatibility with tools that read IRC.
 
@@ -162,5 +176,6 @@ The rollups also contain the messages of users and channels which opted out (the
 
 - Kick's websocket and website API are unofficial and can change. Rustlog skips events it cannot parse instead of failing.
 - The official API may not know every account (for example deleted ones). Rustlog then falls back to the names it has logged.
-- Only the events in the table above are logged. Polls, predictions, pinned messages and mode changes are ignored.
+- Only the events in the table above are logged. Polls, predictions, pinned messages, goals, the Kicks leaderboard and mode changes are ignored.
+- Which events Kick publishes where was found out by listening, not from documentation. Messages, replies, bans, timeouts, unbans, deleted messages, hosts, channel point rewards and Kicks gifts were seen on the channels above. Gifted subscriptions and subscriptions were not seen in the time that was tried, they are read from the channels Kick's web client uses for them (`chatroom_<chatroom id>` and `chatrooms.<chatroom id>.v2`).
 - Moderation events from before rustlog joined a chat, or while it was disconnected, are not available. A ban which was given while rustlog was away can be lifted again without rustlog knowing, so a ban in the history can be shown as going on while it is not.

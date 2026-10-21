@@ -525,24 +525,32 @@ pub async fn check_users_exist(
 pub struct ChatroomRow {
     pub channel_id: String,
     pub chatroom_id: u64,
+    /// Kick's own id of the channel, 0 if it is not known (rows from before it was stored)
+    pub kick_channel_id: u64,
 }
 
 /// Reads all known chatroom ids.
 /// `FINAL` makes the table return only the most recent row of each channel.
 pub async fn read_chatrooms(db: &Client) -> Result<Vec<ChatroomRow>> {
     let rows = db
-        .query("SELECT channel_id, chatroom_id FROM kick_chatrooms FINAL")
+        .query("SELECT channel_id, chatroom_id, kick_channel_id FROM kick_chatrooms FINAL")
         .fetch_all::<ChatroomRow>()
         .await?;
 
     Ok(rows)
 }
 
-/// Remembers the chatroom id of a channel
-pub async fn save_chatroom(db: &Client, channel_id: &str, chatroom_id: u64) -> Result<()> {
+/// Remembers the chatroom id of a channel, and Kick's own id of the channel if it is known
+pub async fn save_chatroom(
+    db: &Client,
+    channel_id: &str,
+    chatroom_id: u64,
+    kick_channel_id: Option<u64>,
+) -> Result<()> {
     let row = ChatroomRow {
         channel_id: channel_id.to_owned(),
         chatroom_id,
+        kick_channel_id: kick_channel_id.unwrap_or(0),
     };
 
     let mut insert = db.insert("kick_chatrooms")?;

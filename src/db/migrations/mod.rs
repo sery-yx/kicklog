@@ -114,6 +114,18 @@ ORDER BY channel_id",
     // older config has is imported here.
     run_migration(db, "12_user_tables", UserTablesMigration { config }).await?;
 
+    // Kick publishes the Kicks gifts of a channel under the id Kick has for the channel itself,
+    // which is neither the chatroom id nor the user id of the broadcaster. Rows from before
+    // have 0 here, and get the id the next time their channel is looked up.
+    run_migration(
+        db,
+        "13_kick_channel_ids",
+        "
+ALTER TABLE kick_chatrooms
+ADD COLUMN IF NOT EXISTS kick_channel_id UInt64 DEFAULT 0 CODEC(ZSTD(8))",
+    )
+    .await?;
+
     Ok(())
 }
 

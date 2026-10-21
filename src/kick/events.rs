@@ -13,10 +13,7 @@ pub const USER_BANNED_EVENT: &str = "App\\Events\\UserBannedEvent";
 pub const USER_UNBANNED_EVENT: &str = "App\\Events\\UserUnbannedEvent";
 pub const CHATROOM_CLEAR_EVENT: &str = "App\\Events\\ChatroomClearEvent";
 pub const SUBSCRIPTION_EVENT: &str = "App\\Events\\SubscriptionEvent";
-pub const GIFTED_SUBSCRIPTIONS_EVENT: &str = "App\\Events\\GiftedSubscriptionsEvent";
 pub const STREAM_HOST_EVENT: &str = "App\\Events\\StreamHostEvent";
-pub const REWARD_REDEEMED_EVENT: &str = "App\\Events\\RewardRedeemedEvent";
-pub const KICKS_GIFTED_EVENT: &str = "App\\Events\\KicksGifted";
 
 /// The name used for gifts of which Kick does not tell who sent them
 pub const ANONYMOUS_GIFTER: &str = "Anonymous";
@@ -142,6 +139,35 @@ pub enum KickEvent {
     },
 }
 
+/// The events of the channels `chatroom_<chatroom id>` and `channel_<channel id>` (see
+/// [`super::pusher::Room`]) do not have the `App\Events\` prefix in their names
+pub const REWARD_REDEEMED_EVENT_UNPREFIXED: &str = "RewardRedeemedEvent";
+pub const GIFTED_SUBSCRIPTIONS_EVENT_UNPREFIXED: &str = "GiftedSubscriptionsEvent";
+pub const KICKS_GIFTED_EVENT_UNPREFIXED: &str = "KicksGifted";
+
+/// Parses the payload of an event of the channel `chatroom_<chatroom id>`: channel point
+/// rewards and gifted subscriptions. Returns `None` for events which are not logged and for
+/// payloads that do not have the expected shape.
+///
+/// Each event is only read from one channel. Kick's web client listens for gifted
+/// subscriptions on `channel_<channel id>` as well, reading them there too would log a gift
+/// twice if Kick publishes it on both.
+pub fn parse_rewards_channel_event(name: &str, data: &Value) -> Option<KickEvent> {
+    match name {
+        REWARD_REDEEMED_EVENT_UNPREFIXED => parse_reward_redeemed(data),
+        GIFTED_SUBSCRIPTIONS_EVENT_UNPREFIXED => parse_gifted_subscriptions(data),
+        _ => None,
+    }
+}
+
+/// Parses the payload of an event of the channel `channel_<channel id>`: Kicks gifts
+pub fn parse_kicks_channel_event(name: &str, data: &Value) -> Option<KickEvent> {
+    match name {
+        KICKS_GIFTED_EVENT_UNPREFIXED => parse_kicks_gifted(data),
+        _ => None,
+    }
+}
+
 /// Parses the payload of a chat event. Returns `None` for events which are not logged
 /// and for payloads that do not have the expected shape.
 pub fn parse_event(name: &str, data: &Value) -> Option<KickEvent> {
@@ -152,10 +178,7 @@ pub fn parse_event(name: &str, data: &Value) -> Option<KickEvent> {
         USER_UNBANNED_EVENT => parse_unbanned(data),
         CHATROOM_CLEAR_EVENT => Some(KickEvent::ChatCleared),
         SUBSCRIPTION_EVENT => parse_subscription(data),
-        GIFTED_SUBSCRIPTIONS_EVENT => parse_gifted_subscriptions(data),
         STREAM_HOST_EVENT => parse_host(data),
-        REWARD_REDEEMED_EVENT => parse_reward_redeemed(data),
-        KICKS_GIFTED_EVENT => parse_kicks_gifted(data),
         _ => None,
     }
 }
@@ -797,8 +820,8 @@ mod tests {
         );
 
         assert_eq!(
-            parse_event(
-                GIFTED_SUBSCRIPTIONS_EVENT,
+            parse_rewards_channel_event(
+                GIFTED_SUBSCRIPTIONS_EVENT_UNPREFIXED,
                 &json!({
                     "chatroom_id": 1,
                     "gifted_usernames": ["a", "b", "c"],
@@ -816,8 +839,8 @@ mod tests {
 
         // a gift event without any recipients carries nothing worth logging
         assert_eq!(
-            parse_event(
-                GIFTED_SUBSCRIPTIONS_EVENT,
+            parse_rewards_channel_event(
+                GIFTED_SUBSCRIPTIONS_EVENT_UNPREFIXED,
                 &json!({"chatroom_id": 1, "gifted_usernames": [], "gifter_username": "x"})
             ),
             None
@@ -825,7 +848,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_host_reward_and_kicks() {
+    fn parses_hosts() {
         assert_eq!(
             parse_event(
                 STREAM_HOST_EVENT,
@@ -837,12 +860,17 @@ mod tests {
                 message: "hi".to_owned()
             })
         );
+    }
 
+    #[test]
+    fn parses_the_events_of_the_rewards_and_kicks_channels() {
+        // as Kick sends them on `chatroom_<chatroom id>` and `channel_<channel id>`
+        let reward = json!({
+            "reward_title": "Hydrate", "user_id": 7, "channel_id": 669, "username": "Viewer",
+            "user_input": "now", "reward_background_color": "#53fc18"
+        });
         assert_eq!(
-            parse_event(
-                REWARD_REDEEMED_EVENT,
-                &json!({"reward_title": "Hydrate", "user_id": 7, "username": "Viewer", "user_input": "now"})
-            ),
+            parse_rewards_channel_event(REWARD_REDEEMED_EVENT_UNPREFIXED, &reward),
             Some(KickEvent::RewardRedeemed {
                 user: UserRef {
                     id: "7".to_owned(),
@@ -854,11 +882,13 @@ mod tests {
             })
         );
 
+        let gift = json!({
+            "gift_transaction_id": "abc", "message": "w",
+            "sender": {"id": 9, "username": "Whale", "username_color": "#BC66FF"},
+            "gift": {"gift_id": "rage_quit", "name": "Rage Quit", "amount": 500, "type": "LEVEL_UP"}
+        });
         assert_eq!(
-            parse_event(
-                KICKS_GIFTED_EVENT,
-                &json!({"message": "w", "sender": {"id": 9, "username": "Whale"}, "gift": {"name": "Rage Quit", "amount": 500}})
-            ),
+            parse_kicks_channel_event(KICKS_GIFTED_EVENT_UNPREFIXED, &gift),
             Some(KickEvent::KicksGifted {
                 sender: UserRef {
                     id: "9".to_owned(),
@@ -870,6 +900,41 @@ mod tests {
                 message: "w".to_owned(),
             })
         );
+
+        let gifted = json!({
+            "gifter_username": "Gifter", "gifted_usernames": ["a", "b"], "gifter_total": 10
+        });
+        assert!(matches!(
+            parse_rewards_channel_event(GIFTED_SUBSCRIPTIONS_EVENT_UNPREFIXED, &gifted),
+            Some(KickEvent::GiftedSubscriptions { count: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn each_event_is_only_read_from_its_own_channel() {
+        let reward = json!({"reward_title": "Hydrate", "user_id": 7, "username": "Viewer"});
+        let gift = json!({"sender": {"id": 9, "username": "Whale"}, "gift": {"name": "x", "amount": 1}});
+        let gifted = json!({"gifter_username": "Gifter", "gifted_usernames": ["a"]});
+
+        assert_eq!(parse_rewards_channel_event(KICKS_GIFTED_EVENT_UNPREFIXED, &gift), None);
+        assert_eq!(parse_kicks_channel_event(REWARD_REDEEMED_EVENT_UNPREFIXED, &reward), None);
+        // the web client listens for gifted subscriptions on both, they are read from one
+        assert_eq!(
+            parse_kicks_channel_event(GIFTED_SUBSCRIPTIONS_EVENT_UNPREFIXED, &gifted),
+            None
+        );
+        // the chat channel does not carry them, and they are not read from it
+        for name in [
+            "App\\Events\\RewardRedeemedEvent",
+            "App\\Events\\GiftedSubscriptionsEvent",
+            "App\\Events\\KicksGifted",
+        ] {
+            assert_eq!(parse_event(name, &reward), None);
+            assert_eq!(parse_event(name, &gift), None);
+            assert_eq!(parse_event(name, &gifted), None);
+            assert_eq!(parse_rewards_channel_event(name, &reward), None);
+            assert_eq!(parse_kicks_channel_event(name, &gift), None);
+        }
     }
 
     #[test]

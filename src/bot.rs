@@ -2,10 +2,10 @@ use crate::{
     app::App,
     db::{self, schema::StructuredMessage},
     kick::{
-        api::KickApi,
+        api::{KickApi, WebChannel},
         convert::{self, ChannelRef, TimestampAssigner, ChatIndex},
         events::{self, KickEvent, UserRef},
-        pusher::{self, PusherConfig, PusherEvent, PusherHandle},
+        pusher::{self, ChannelKind, PusherConfig, PusherEvent, PusherHandle, Room},
     },
     ShutdownRx,
 };
@@ -16,8 +16,11 @@ use lazy_static::lazy_static;
 use prometheus::{register_int_counter_vec, IntCounterVec};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio::{
@@ -38,6 +41,9 @@ const MAX_LOGGED_JOIN_FAILURES: usize = 20;
 const WEBSITE_LOOKUP_DELAY: Duration = Duration::from_millis(300);
 const EVENT_BUFFER_SIZE: usize = 10_000;
 const PUSHER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(4);
+/// Looking up the ids Kick has for the channels stops for a while after this many failures
+/// in a row
+const MAX_KICK_CHANNEL_LOOKUP_FAILURES: usize = 3;
 /// The lookup of the Pusher key at startup makes a request and may repeat it through curl,
 /// which are 20 seconds each
 const PUSHER_KEY_LOOKUP_TIMEOUT: Duration = Duration::from_secs(45);
@@ -140,6 +146,15 @@ struct BotState {
     channels: DashMap<u64, ChannelRef>,
     /// Channel id -> chatroom id, for every channel whose chatroom is known
     known_chatrooms: DashMap<String, u64>,
+    /// Channel id -> Kick's own id of the channel, for every channel for which it is known
+    known_kick_channels: DashMap<String, u64>,
+    /// Kick's own id of a channel -> chatroom id, for the logged channels. The Kicks gifts are
+    /// published under that id.
+    chatrooms_by_kick_channel: DashMap<u64, u64>,
+    /// Channel id -> when the id Kick has for the channel was last looked up
+    kick_channel_attempts: DashMap<String, Instant>,
+    /// Whether the ids Kick has for the channels are being looked up right now
+    kick_channel_lookup_running: AtomicBool,
     shared: Mutex<SharedState>,
     /// Only one request to join or leave channels is carried out at a time, so that they
     /// do not overtake each other and do not write the config at the same time
@@ -167,6 +182,21 @@ impl BotState {
         self.known_chatrooms
             .get(channel_id)
             .map(|entry| *entry.value())
+    }
+
+    fn kick_channel_of(&self, channel_id: &str) -> Option<u64> {
+        self.known_kick_channels
+            .get(channel_id)
+            .map(|entry| *entry.value())
+    }
+
+    fn channel_by_kick_channel(&self, kick_channel_id: u64) -> Option<ChannelRef> {
+        let chatroom_id = self
+            .chatrooms_by_kick_channel
+            .get(&kick_channel_id)
+            .map(|entry| *entry.value())?;
+
+        self.channel_by_chatroom(chatroom_id)
     }
 }
 
@@ -245,6 +275,11 @@ impl Bot {
             Ok(rows) => {
                 info!("Loaded {} known chatrooms", rows.len());
                 for row in rows {
+                    if row.kick_channel_id > 0 {
+                        self.state
+                            .known_kick_channels
+                            .insert(row.channel_id.clone(), row.kick_channel_id);
+                    }
                     self.state
                         .known_chatrooms
                         .insert(row.channel_id, row.chatroom_id);
@@ -335,6 +370,8 @@ impl Bot {
     /// Joins the given channels (user id -> login) which are still configured
     async fn join_channels(&self, channels: HashMap<String, String>) -> JoinSummary {
         let mut summary = JoinSummary::default();
+        // Channels whose chatroom was stored before the id of the channel was
+        let mut without_kick_channel = Vec::new();
 
         for (channel_id, channel_login) in channels {
             // Resolving the chatrooms of many channels takes a long time, and an admin may
@@ -345,8 +382,14 @@ impl Bot {
             }
 
             debug!("Logging channel {channel_login}");
+            let chatroom_was_known = self.state.chatroom_of(&channel_id).is_some();
             match self.join_channel(&channel_id, &channel_login, true).await {
-                Ok(()) => summary.joined += 1,
+                Ok(()) => {
+                    summary.joined += 1;
+                    if chatroom_was_known && self.state.kick_channel_of(&channel_id).is_none() {
+                        without_kick_channel.push((channel_id, channel_login));
+                    }
+                }
                 Err(err) if err.is::<CapacityReached>() => summary.over_capacity += 1,
                 Err(err) => {
                     summary.failed += 1;
@@ -359,7 +402,71 @@ impl Bot {
             }
         }
 
+        // In the background: with many channels this takes hours, and the retries of channels
+        // which could not be joined must not wait for it. Only one pass runs at a time, the
+        // channels which a pass does not get to are taken care of by a later one.
+        if !without_kick_channel.is_empty()
+            && !self
+                .state
+                .kick_channel_lookup_running
+                .swap(true, Ordering::SeqCst)
+        {
+            let bot = self.clone();
+            tokio::spawn(async move {
+                bot.look_up_kick_channels(without_kick_channel).await;
+                bot.state
+                    .kick_channel_lookup_running
+                    .store(false, Ordering::SeqCst);
+            });
+        }
+
         summary
+    }
+
+    /// Looks up Kick's own id of channels which are being listened to already. Every one of
+    /// these takes a lookup on Kick's rate limited website, which is why this is done after all
+    /// the channels are joined. Without the id, the Kicks gifts of a channel are not logged.
+    ///
+    /// A channel is only tried once in a while, and a website which does not answer (it may be
+    /// blocking this server, which is when `chatroomIds` is used) ends the pass early. The
+    /// channels which were not tried yet are the next ones to be.
+    async fn look_up_kick_channels(&self, channels: Vec<(String, String)>) {
+        let mut tried = 0;
+        let mut failures_in_a_row = 0;
+
+        for (channel_id, channel_login) in channels {
+            if !self.is_configured(&channel_id, &channel_login) {
+                continue;
+            }
+            let tried_recently = self
+                .state
+                .kick_channel_attempts
+                .get(&channel_id)
+                .is_some_and(|at| at.elapsed() < CHANNEL_REJOIN_INTERVAL);
+            if tried_recently {
+                continue;
+            }
+            self.state
+                .kick_channel_attempts
+                .insert(channel_id.clone(), Instant::now());
+
+            tried += 1;
+            match self.look_up_kick_channel(&channel_id, &channel_login).await {
+                Ok(()) => failures_in_a_row = 0,
+                Err(err) => {
+                    debug!("Could not look up Kick's id of channel {channel_login}: {err:#}");
+                    failures_in_a_row += 1;
+                    if failures_in_a_row >= MAX_KICK_CHANNEL_LOOKUP_FAILURES {
+                        warn!("Looking up Kick's id of channels failed {failures_in_a_row} times in a row, the Kicks gifts of the other channels are looked up later");
+                        break;
+                    }
+                }
+            }
+        }
+
+        if tried > 0 {
+            debug!("Tried to look up Kick's id of {tried} channels");
+        }
     }
 
     /// Whether the channel is one of the logged ones, by id or by name. The entries are
@@ -388,14 +495,30 @@ impl Bot {
     }
 
     async fn handle_event(&self, event: PusherEvent) -> anyhow::Result<()> {
-        let Some(chatroom_id) = pusher::chatroom_id_from_channel(&event.channel) else {
+        let Some(kind) = ChannelKind::parse(&event.channel) else {
             return Ok(());
         };
-        let Some(channel) = self.state.channel_by_chatroom(chatroom_id) else {
-            trace!("Ignoring an event for chatroom {chatroom_id} which is not logged");
+        let channel = match kind {
+            ChannelKind::Chat(chatroom_id) | ChannelKind::Rewards(chatroom_id) => {
+                self.state.channel_by_chatroom(chatroom_id)
+            }
+            ChannelKind::Kicks(kick_channel_id) => {
+                self.state.channel_by_kick_channel(kick_channel_id)
+            }
+        };
+        let Some(channel) = channel else {
+            trace!("Ignoring an event of {} which is not logged", event.channel);
             return Ok(());
         };
-        let Some(kick_event) = events::parse_event(&event.event, &event.data) else {
+        // Each kind of channel has its own events, with names of their own
+        let kick_event = match kind {
+            ChannelKind::Chat(_) => events::parse_event(&event.event, &event.data),
+            ChannelKind::Rewards(_) => {
+                events::parse_rewards_channel_event(&event.event, &event.data)
+            }
+            ChannelKind::Kicks(_) => events::parse_kicks_channel_event(&event.event, &event.data),
+        };
+        let Some(kick_event) = kick_event else {
             trace!("Ignoring event {}", event.event);
             return Ok(());
         };
@@ -696,29 +819,56 @@ impl Bot {
                     login: channel_login.to_owned(),
                 },
             );
+            // Still under the lock, leaving the channel cannot slip in between
+            self.subscribe_room(channel_id, chatroom_id);
         }
-        self.pusher.subscribe(chatroom_id).await;
 
         Ok(())
     }
 
+    /// Listens to the chatroom of a channel, and to the Kicks gifts of the channel if its id
+    /// is known. Called with the lock for joining and leaving held.
+    fn subscribe_room(&self, channel_id: &str, chatroom_id: u64) {
+        let kick_channel_id = self.state.kick_channel_of(channel_id);
+        if let Some(kick_channel_id) = kick_channel_id {
+            self.state
+                .chatrooms_by_kick_channel
+                .insert(kick_channel_id, chatroom_id);
+        }
+
+        self.pusher.subscribe(Room {
+            chatroom_id,
+            kick_channel_id,
+        });
+    }
+
     async fn part_channel(&self, channel_id: &str) {
+        // The lock for joining, so that the channel cannot be joined again halfway through
+        let _leaving = self.state.join_lock.lock().unwrap();
+
         if let Some(chatroom_id) = self.state.chatroom_of(channel_id) {
             if self.state.channels.remove(&chatroom_id).is_some() {
-                self.pusher.unsubscribe(chatroom_id).await;
+                if let Some(kick_channel_id) = self.state.kick_channel_of(channel_id) {
+                    self.state.chatrooms_by_kick_channel.remove(&kick_channel_id);
+                }
+                self.pusher.unsubscribe(chatroom_id);
             }
         }
     }
 
-    /// Finds the chatroom the chat of a channel is published under
-    async fn resolve_chatroom(&self, channel_id: &str, channel_login: &str) -> anyhow::Result<u64> {
+    /// Looks a channel up on Kick's website
+    async fn look_up_channel(
+        &self,
+        channel_id: &str,
+        channel_login: &str,
+    ) -> anyhow::Result<WebChannel> {
         let lookup = self.app.kick.web_channel(channel_login).await;
         // Kick's website is rate limited, so wait after every lookup. Failed ones count as well,
         // otherwise a problem would make the bot hammer the website.
         sleep(WEBSITE_LOOKUP_DELAY).await;
 
         let channel = lookup
-            .with_context(|| format!("Could not look up the chatroom of {channel_login}"))?;
+            .with_context(|| format!("Could not look up {channel_login} on Kick's website"))?;
 
         if channel.user_id != channel_id {
             bail!(
@@ -727,14 +877,72 @@ impl Bot {
             );
         }
 
+        Ok(channel)
+    }
+
+    /// Finds the chatroom the chat of a channel is published under
+    async fn resolve_chatroom(&self, channel_id: &str, channel_login: &str) -> anyhow::Result<u64> {
+        let channel = self.look_up_channel(channel_id, channel_login).await?;
+
         self.state
             .known_chatrooms
             .insert(channel_id.to_owned(), channel.chatroom_id);
-        if let Err(err) = db::save_chatroom(&self.app.db, channel_id, channel.chatroom_id).await {
+        if let Some(kick_channel_id) = channel.kick_channel_id {
+            self.state
+                .known_kick_channels
+                .insert(channel_id.to_owned(), kick_channel_id);
+        }
+        if let Err(err) = db::save_chatroom(
+            &self.app.db,
+            channel_id,
+            channel.chatroom_id,
+            channel.kick_channel_id,
+        )
+        .await
+        {
             warn!("Could not save the chatroom of {channel_login}: {err:?}");
         }
 
         Ok(channel.chatroom_id)
+    }
+
+    /// Finds Kick's own id of a channel whose chatroom is known already, and starts listening
+    /// to the Kicks gifts of the channel. The chatroom which is in use stays as it is, it may
+    /// be one from the config.
+    async fn look_up_kick_channel(
+        &self,
+        channel_id: &str,
+        channel_login: &str,
+    ) -> anyhow::Result<()> {
+        let channel = self.look_up_channel(channel_id, channel_login).await?;
+        let Some(kick_channel_id) = channel.kick_channel_id else {
+            bail!("Kick does not say what the id of {channel_login} is");
+        };
+
+        self.state
+            .known_kick_channels
+            .insert(channel_id.to_owned(), kick_channel_id);
+        if let Err(err) = db::save_chatroom(
+            &self.app.db,
+            channel_id,
+            channel.chatroom_id,
+            Some(kick_channel_id),
+        )
+        .await
+        {
+            warn!("Could not save the id of {channel_login}: {err:?}");
+        }
+
+        // The channel may have been left in the meantime. The lock for joining and leaving keeps
+        // it from being left between the check and the subscription.
+        let _checking = self.state.join_lock.lock().unwrap();
+        if let Some(chatroom_id) = self.state.chatroom_of(channel_id) {
+            if self.state.channels.contains_key(&chatroom_id) {
+                self.subscribe_room(channel_id, chatroom_id);
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -971,6 +1179,82 @@ mod tests {
         assert_eq!(tag(&hidden, "moderator-user-login"), None);
         assert_eq!(firehose_rx.try_recv().unwrap(), named);
         assert_eq!(firehose_rx.try_recv().unwrap(), hidden);
+
+        pusher_task.abort();
+    }
+
+    #[tokio::test]
+    async fn rewards_and_kicks_gifts_come_from_their_own_pusher_channels() {
+        let app = App::for_tests("127.0.0.1:0");
+        let (writer_tx, mut writer_rx) = mpsc::channel(16);
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let (pusher, pusher_task) = pusher::spawn_with_source(
+            PusherConfig {
+                key: "key".to_owned(),
+                cluster: "us2".to_owned(),
+                max_channels_per_connection: 90,
+                max_connections: None,
+                new_connection_every: Duration::from_secs(2),
+            },
+            None,
+            event_tx,
+            shutdown_rx,
+        );
+        let bot = Bot {
+            app,
+            writer_tx,
+            pusher,
+            state: Arc::new(BotState::default()),
+        };
+        // a channel with the user id 676 and the chatroom 668. Kick's own id of it is made up
+        // here (669), it differs from the other two for many channels.
+        bot.state.known_chatrooms.insert("676".to_owned(), 668);
+        bot.state.channels.insert(
+            668,
+            ChannelRef {
+                id: "676".to_owned(),
+                login: "xqc".to_owned(),
+            },
+        );
+        bot.state.chatrooms_by_kick_channel.insert(669, 668);
+
+        let event = |channel: &str, name: &str, data: serde_json::Value| PusherEvent {
+            channel: channel.to_owned(),
+            event: name.to_owned(),
+            data,
+        };
+        let reward = serde_json::json!({
+            "reward_title": "Hydrate", "user_id": 485695, "channel_id": 669,
+            "username": "Some_User", "user_input": ""
+        });
+        let gift = serde_json::json!({
+            "message": "", "sender": {"id": 12345, "username": "Some_User"},
+            "gift": {"name": "Rage Quit", "amount": 500}
+        });
+
+        bot.handle_event(event("chatroom_668", "RewardRedeemedEvent", reward))
+            .await
+            .unwrap();
+        let logged = writer_rx.try_recv().unwrap();
+        assert_eq!(logged.channel_id, "676");
+        assert_eq!(tag(&logged, "msg-id"), Some("reward-redeemed"));
+
+        bot.handle_event(event("channel_669", "KicksGifted", gift.clone()))
+            .await
+            .unwrap();
+        let logged = writer_rx.try_recv().unwrap();
+        assert_eq!(logged.channel_id, "676");
+        assert_eq!(tag(&logged, "msg-id"), Some("kicks-gifted"));
+
+        // a channel which is not logged, and a name which the chat channel does not use
+        bot.handle_event(event("channel_999", "KicksGifted", gift.clone()))
+            .await
+            .unwrap();
+        bot.handle_event(event("chatrooms.668.v2", "KicksGifted", gift))
+            .await
+            .unwrap();
+        assert!(writer_rx.try_recv().is_err());
 
         pusher_task.abort();
     }

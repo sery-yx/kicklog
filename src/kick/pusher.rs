@@ -2,7 +2,8 @@
 //!
 //! Kick publishes the chat of every channel on the public Pusher channel `chatrooms.{id}.v2`.
 //! Listening requires no authentication, which makes this the equivalent of an anonymous
-//! Twitch IRC connection.
+//! Twitch IRC connection. Channel point rewards, gifted subscriptions and Kicks gifts are
+//! published on two more channels, see [`Room`].
 //!
 //! The chatrooms are spread over several websocket connections ("shards"), the way the IRC
 //! library of rustlog (`twitch-irc`) spreads channels over IRC connections:
@@ -21,7 +22,7 @@ use crate::ShutdownRx;
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -201,9 +202,36 @@ pub struct PusherEvent {
     pub data: Value,
 }
 
+/// A chatroom to listen to. Kick publishes things on three Pusher channels per channel, each
+/// with its own events:
+///
+/// - `chatrooms.<chatroom id>.v2`: chat messages, bans, timeouts, deleted messages, hosts,
+/// - `chatroom_<chatroom id>`: channel point rewards and gifted subscriptions,
+/// - `channel_<channel id>`: Kicks gifts. This is Kick's id of the channel, which is neither
+///   the chatroom id nor the user id of the broadcaster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Room {
+    pub chatroom_id: u64,
+    /// `None` if it is not known (yet), the Kicks gifts of the channel are not logged then
+    pub kick_channel_id: Option<u64>,
+}
+
+impl Room {
+    /// The names of the Pusher channels to subscribe to
+    fn channels(&self) -> Vec<String> {
+        let mut channels = vec![
+            chatroom_channel(self.chatroom_id),
+            rewards_channel(self.chatroom_id),
+        ];
+        channels.extend(self.kick_channel_id.map(kicks_channel));
+
+        channels
+    }
+}
+
 #[derive(Debug)]
 pub enum PusherCommand {
-    Subscribe(u64),
+    Subscribe(Room),
     Unsubscribe(u64),
 }
 
@@ -224,19 +252,25 @@ impl PusherHandle {
         self.capacity
     }
 
-    /// Never waits, the command is carried out in the background
-    pub async fn subscribe(&self, chatroom_id: u64) {
+    /// Never waits, the command is carried out in the background (and it is not an `async fn`
+    /// so it can be called while holding a lock, which keeps a subscription from overtaking
+    /// the unsubscription that belongs after it). Subscribing to a room again adds what is
+    /// new about it (the id of the channel, once it is known).
+    pub fn subscribe(&self, room: Room) {
         if self
             .command_tx
-            .send(PusherCommand::Subscribe(chatroom_id))
+            .send(PusherCommand::Subscribe(room))
             .is_err()
         {
-            warn!("Could not subscribe to chatroom {chatroom_id}, the Pusher task is gone");
+            warn!(
+                "Could not subscribe to chatroom {}, the Pusher task is gone",
+                room.chatroom_id
+            );
         }
     }
 
     /// Never waits, the command is carried out in the background
-    pub async fn unsubscribe(&self, chatroom_id: u64) {
+    pub fn unsubscribe(&self, chatroom_id: u64) {
         if self
             .command_tx
             .send(PusherCommand::Unsubscribe(chatroom_id))
@@ -304,18 +338,59 @@ pub fn chatroom_id_from_channel(channel: &str) -> Option<u64> {
         .ok()
 }
 
-fn subscribe_frame(chatroom_id: u64) -> String {
+/// The name of the Pusher channel with the channel point rewards and the gifted subscriptions
+/// of a chatroom
+pub fn rewards_channel(chatroom_id: u64) -> String {
+    format!("chatroom_{chatroom_id}")
+}
+
+/// The name of the Pusher channel with the Kicks gifts of a channel
+pub fn kicks_channel(kick_channel_id: u64) -> String {
+    format!("channel_{kick_channel_id}")
+}
+
+/// Which of the Pusher channels of a room a channel name is
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelKind {
+    /// `chatrooms.<chatroom id>.v2`
+    Chat(u64),
+    /// `chatroom_<chatroom id>`
+    Rewards(u64),
+    /// `channel_<channel id>`
+    Kicks(u64),
+}
+
+impl ChannelKind {
+    pub fn parse(channel: &str) -> Option<Self> {
+        if let Some(chatroom_id) = chatroom_id_from_channel(channel) {
+            return Some(Self::Chat(chatroom_id));
+        }
+        if let Some(chatroom_id) = channel
+            .strip_prefix("chatroom_")
+            .and_then(|id| id.parse().ok())
+        {
+            return Some(Self::Rewards(chatroom_id));
+        }
+
+        channel
+            .strip_prefix("channel_")
+            .and_then(|id| id.parse().ok())
+            .map(Self::Kicks)
+    }
+}
+
+fn subscribe_frame(channel: &str) -> String {
     json!({
         "event": "pusher:subscribe",
-        "data": {"auth": "", "channel": chatroom_channel(chatroom_id)},
+        "data": {"auth": "", "channel": channel},
     })
     .to_string()
 }
 
-fn unsubscribe_frame(chatroom_id: u64) -> String {
+fn unsubscribe_frame(channel: &str) -> String {
     json!({
         "event": "pusher:unsubscribe",
-        "data": {"channel": chatroom_channel(chatroom_id)},
+        "data": {"channel": channel},
     })
     .to_string()
 }
@@ -390,6 +465,11 @@ impl Allocator {
         }
     }
 
+    /// The connection which carries a chatroom
+    fn connection_of(&self, chatroom_id: u64) -> Option<usize> {
+        self.assigned.get(&chatroom_id).copied()
+    }
+
     /// Frees the slot of a chatroom, returns the connection it was carried by
     fn release(&mut self, chatroom_id: u64) -> Option<usize> {
         let connection = self.assigned.remove(&chatroom_id)?;
@@ -402,9 +482,12 @@ impl Allocator {
 
 #[derive(Debug)]
 enum ShardCommand {
-    Subscribe(u64),
+    Subscribe(Room),
     Unsubscribe(u64),
 }
+
+/// The rooms a connection listens to: chatroom id -> id of the channel, if it is known
+type Subscribed = HashMap<u64, Option<u64>>;
 
 /// Spaces out the opening of connections the way the IRC library of the original rustlog
 /// (`twitch-irc`) does: connections are opened one at a time. The turn lasts until the
@@ -466,7 +549,7 @@ enum Turn<'a> {
 /// are applied in the meantime.
 async fn await_turn<'a>(
     pacer: &'a ConnectionPacer,
-    subscribed: &mut HashSet<u64>,
+    subscribed: &mut Subscribed,
     command_rx: &mut mpsc::UnboundedReceiver<ShardCommand>,
     shutdown_rx: &mut ShutdownRx,
 ) -> Turn<'a> {
@@ -509,11 +592,20 @@ async fn run_manager(
     loop {
         tokio::select! {
             command = command_rx.recv() => match command {
-                Some(PusherCommand::Subscribe(chatroom_id)) => match allocator.allocate(chatroom_id) {
-                    Allocation::AlreadyAssigned => {}
+                Some(PusherCommand::Subscribe(room)) => match allocator.allocate(room.chatroom_id) {
+                    // The connection finds out what is new about the room, for example the
+                    // id of the channel
+                    Allocation::AlreadyAssigned => {
+                        if let Some(connection) = allocator.connection_of(room.chatroom_id) {
+                            if shard_txs[connection].send(ShardCommand::Subscribe(room)).is_err() {
+                                error!("Pusher connection {connection} is gone, could not update chatroom {}", room.chatroom_id);
+                            }
+                        }
+                    }
                     Allocation::Full => {
                         error!(
-                            "Cannot listen to chatroom {chatroom_id}: all {} connections are full ({} chatrooms each)",
+                            "Cannot listen to chatroom {}: all {} connections are full ({} chatrooms each)",
+                            room.chatroom_id,
                             config.max_connections.unwrap_or_default(),
                             config.max_channels_per_connection.max(1)
                         );
@@ -532,8 +624,8 @@ async fn run_manager(
                             shard_txs.push(shard_tx);
                         }
 
-                        if shard_txs[connection].send(ShardCommand::Subscribe(chatroom_id)).is_err() {
-                            error!("Pusher connection {connection} is gone, could not subscribe to chatroom {chatroom_id}");
+                        if shard_txs[connection].send(ShardCommand::Subscribe(room)).is_err() {
+                            error!("Pusher connection {connection} is gone, could not subscribe to chatroom {}", room.chatroom_id);
                         }
                     }
                 },
@@ -575,7 +667,7 @@ async fn run_shard(
     event_tx: mpsc::Sender<PusherEvent>,
     mut shutdown_rx: ShutdownRx,
 ) {
-    let mut subscribed: HashSet<u64> = HashSet::new();
+    let mut subscribed = Subscribed::new();
     let mut backoff = INITIAL_BACKOFF;
 
     loop {
@@ -663,10 +755,10 @@ async fn run_shard(
     }
 }
 
-fn apply_command(subscribed: &mut HashSet<u64>, command: ShardCommand) {
+fn apply_command(subscribed: &mut Subscribed, command: ShardCommand) {
     match command {
-        ShardCommand::Subscribe(chatroom_id) => {
-            subscribed.insert(chatroom_id);
+        ShardCommand::Subscribe(room) => {
+            remember_room(subscribed, room);
         }
         ShardCommand::Unsubscribe(chatroom_id) => {
             subscribed.remove(&chatroom_id);
@@ -674,11 +766,29 @@ fn apply_command(subscribed: &mut HashSet<u64>, command: ShardCommand) {
     }
 }
 
+/// Adds a room to the ones listened to. A room which is added again keeps the id of its
+/// channel if the new entry does not have one. Returns the room as it was before, if it was.
+fn remember_room(subscribed: &mut Subscribed, room: Room) -> Option<Room> {
+    let previous = subscribed
+        .get(&room.chatroom_id)
+        .copied()
+        .map(|kick_channel_id| Room {
+            chatroom_id: room.chatroom_id,
+            kick_channel_id,
+        });
+    let kick_channel_id = room
+        .kick_channel_id
+        .or(previous.and_then(|previous| previous.kick_channel_id));
+    subscribed.insert(room.chatroom_id, kick_channel_id);
+
+    previous
+}
+
 async fn run_connection(
     shard_id: usize,
     url: &str,
     permit: ConnectionPermit<'_>,
-    subscribed: &mut HashSet<u64>,
+    subscribed: &mut Subscribed,
     command_rx: &mut mpsc::UnboundedReceiver<ShardCommand>,
     event_tx: &mpsc::Sender<PusherEvent>,
     shutdown_rx: &mut ShutdownRx,
@@ -747,8 +857,14 @@ async fn run_connection(
                             "Pusher connection {shard_id} established, subscribing to {} chatrooms",
                             subscribed.len()
                         );
-                        for chatroom_id in subscribed.iter() {
-                            if let Err(err) = ws.send(Message::text(subscribe_frame(*chatroom_id))).await {
+                        let channels: Vec<String> = subscribed
+                            .iter()
+                            .flat_map(|(chatroom_id, kick_channel_id)| {
+                                Room { chatroom_id: *chatroom_id, kick_channel_id: *kick_channel_id }.channels()
+                            })
+                            .collect();
+                        for channel in channels {
+                            if let Err(err) = ws.send(Message::text(subscribe_frame(&channel))).await {
                                 return ConnectionEnd::Lost(format!("could not subscribe: {err}"));
                             }
                         }
@@ -791,15 +907,33 @@ async fn run_connection(
                         let _ = ws.close(None).await;
                         return ConnectionEnd::Shutdown;
                     }
-                    Some(ShardCommand::Subscribe(chatroom_id)) => {
-                        if subscribed.insert(chatroom_id) && established {
-                            if let Err(err) = ws.send(Message::text(subscribe_frame(chatroom_id))).await {
-                                return ConnectionEnd::Lost(format!("could not subscribe: {err}"));
+                    Some(ShardCommand::Subscribe(room)) => {
+                        // Only the channels which are new are subscribed to. A room which is
+                        // subscribed to again may just have learned the id of its channel.
+                        let already: Vec<String> = remember_room(subscribed, room)
+                            .map(|previous| previous.channels())
+                            .unwrap_or_default();
+                        let room = Room {
+                            kick_channel_id: subscribed[&room.chatroom_id],
+                            ..room
+                        };
+                        if established {
+                            let channels = room.channels();
+                            for channel in channels.iter().filter(|channel| !already.contains(channel)) {
+                                if let Err(err) = ws.send(Message::text(subscribe_frame(channel))).await {
+                                    return ConnectionEnd::Lost(format!("could not subscribe: {err}"));
+                                }
+                            }
+                            // The id of the channel can only have changed if Kick changed it
+                            for channel in already.iter().filter(|channel| !channels.contains(channel)) {
+                                if let Err(err) = ws.send(Message::text(unsubscribe_frame(channel))).await {
+                                    return ConnectionEnd::Lost(format!("could not unsubscribe: {err}"));
+                                }
                             }
                         }
                     }
                     Some(ShardCommand::Unsubscribe(chatroom_id)) => {
-                        if subscribed.remove(&chatroom_id) {
+                        if let Some(kick_channel_id) = subscribed.remove(&chatroom_id) {
                             // Not while another subscription is already waiting, closing and
                             // reconnecting right away would be pointless
                             if subscribed.is_empty() && command_rx.is_empty() {
@@ -807,8 +941,10 @@ async fn run_connection(
                                 return ConnectionEnd::Idle;
                             }
                             if established {
-                                if let Err(err) = ws.send(Message::text(unsubscribe_frame(chatroom_id))).await {
-                                    return ConnectionEnd::Lost(format!("could not unsubscribe: {err}"));
+                                for channel in (Room { chatroom_id, kick_channel_id }).channels() {
+                                    if let Err(err) = ws.send(Message::text(unsubscribe_frame(&channel))).await {
+                                        return ConnectionEnd::Lost(format!("could not unsubscribe: {err}"));
+                                    }
                                 }
                             }
                         }
@@ -1110,17 +1246,83 @@ mod tests {
 
     #[test]
     fn subscription_frames() {
-        let subscribe: Value = serde_json::from_str(&subscribe_frame(668)).unwrap();
+        let subscribe: Value = serde_json::from_str(&subscribe_frame("chatrooms.668.v2")).unwrap();
         assert_eq!(
             subscribe,
             json!({"event": "pusher:subscribe", "data": {"auth": "", "channel": "chatrooms.668.v2"}})
         );
 
-        let unsubscribe: Value = serde_json::from_str(&unsubscribe_frame(668)).unwrap();
+        let unsubscribe: Value =
+            serde_json::from_str(&unsubscribe_frame("chatrooms.668.v2")).unwrap();
         assert_eq!(
             unsubscribe,
             json!({"event": "pusher:unsubscribe", "data": {"channel": "chatrooms.668.v2"}})
         );
+    }
+
+    fn room(chatroom_id: u64) -> Room {
+        Room {
+            chatroom_id,
+            kick_channel_id: None,
+        }
+    }
+
+    #[test]
+    fn a_room_listens_to_the_channels_kick_publishes_on() {
+        let room = Room {
+            chatroom_id: 668,
+            kick_channel_id: Some(669),
+        };
+        assert_eq!(
+            room.channels(),
+            vec!["chatrooms.668.v2", "chatroom_668", "channel_669"]
+        );
+
+        // the Kicks gifts need the id of the channel
+        assert_eq!(
+            Room {
+                kick_channel_id: None,
+                ..room
+            }
+            .channels(),
+            vec!["chatrooms.668.v2", "chatroom_668"]
+        );
+    }
+
+    #[test]
+    fn channel_names_are_told_apart() {
+        assert_eq!(
+            ChannelKind::parse("chatrooms.668.v2"),
+            Some(ChannelKind::Chat(668))
+        );
+        assert_eq!(
+            ChannelKind::parse("chatroom_668"),
+            Some(ChannelKind::Rewards(668))
+        );
+        assert_eq!(
+            ChannelKind::parse("channel_669"),
+            Some(ChannelKind::Kicks(669))
+        );
+
+        assert_eq!(ChannelKind::parse("chatrooms.668"), None);
+        assert_eq!(ChannelKind::parse("chatroom_abc"), None);
+        assert_eq!(ChannelKind::parse("channel_"), None);
+        assert_eq!(ChannelKind::parse("private-channel_1"), None);
+        assert_eq!(ChannelKind::parse(""), None);
+    }
+
+    #[test]
+    fn allocator_knows_which_connection_carries_a_chatroom() {
+        let mut allocator = Allocator::new(1, None);
+        allocator.allocate(10);
+        allocator.allocate(11);
+
+        assert_eq!(allocator.connection_of(10), Some(0));
+        assert_eq!(allocator.connection_of(11), Some(1));
+        assert_eq!(allocator.connection_of(12), None);
+
+        allocator.release(10);
+        assert_eq!(allocator.connection_of(10), None);
     }
 
     #[test]
@@ -1291,12 +1493,43 @@ mod tests {
 
     #[test]
     fn commands_update_the_subscription_set() {
-        let mut subscribed = HashSet::new();
-        apply_command(&mut subscribed, ShardCommand::Subscribe(1));
-        apply_command(&mut subscribed, ShardCommand::Subscribe(2));
-        apply_command(&mut subscribed, ShardCommand::Subscribe(2));
+        let mut subscribed = Subscribed::new();
+        apply_command(&mut subscribed, ShardCommand::Subscribe(room(1)));
+        apply_command(&mut subscribed, ShardCommand::Subscribe(room(2)));
+        apply_command(&mut subscribed, ShardCommand::Subscribe(room(2)));
         apply_command(&mut subscribed, ShardCommand::Unsubscribe(1));
-        assert_eq!(subscribed, HashSet::from([2]));
+        assert_eq!(subscribed, Subscribed::from([(2, None)]));
+    }
+
+    #[test]
+    fn subscribing_again_adds_the_id_of_the_channel() {
+        let mut subscribed = Subscribed::new();
+        apply_command(&mut subscribed, ShardCommand::Subscribe(room(1)));
+        apply_command(
+            &mut subscribed,
+            ShardCommand::Subscribe(Room {
+                chatroom_id: 1,
+                kick_channel_id: Some(5),
+            }),
+        );
+        assert_eq!(subscribed, Subscribed::from([(1, Some(5))]));
+
+        // an entry without the id does not make the room forget it
+        apply_command(&mut subscribed, ShardCommand::Subscribe(room(1)));
+        assert_eq!(subscribed, Subscribed::from([(1, Some(5))]));
+    }
+
+    #[test]
+    fn remembering_a_room_tells_what_was_known_of_it() {
+        let mut subscribed = Subscribed::new();
+        assert_eq!(remember_room(&mut subscribed, room(1)), None);
+
+        let with_channel = Room {
+            chatroom_id: 1,
+            kick_channel_id: Some(5),
+        };
+        assert_eq!(remember_room(&mut subscribed, with_channel), Some(room(1)));
+        assert_eq!(remember_room(&mut subscribed, room(1)), Some(with_channel));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1369,14 +1602,14 @@ mod tests {
 
         let (command_tx, mut command_rx) = mpsc::unbounded_channel();
         let (_shutdown_tx, mut shutdown_rx) = watch::channel(());
-        let mut subscribed = HashSet::from([1]);
-        command_tx.send(ShardCommand::Subscribe(2)).unwrap();
+        let mut subscribed = Subscribed::from([(1, None)]);
+        command_tx.send(ShardCommand::Subscribe(room(2))).unwrap();
 
         let turn = await_turn(&pacer, &mut subscribed, &mut command_rx, &mut shutdown_rx).await;
 
         assert!(matches!(turn, Turn::Granted(_)));
         assert!(start.elapsed() >= Duration::from_secs(5));
-        assert_eq!(subscribed, HashSet::from([1, 2]));
+        assert_eq!(subscribed, Subscribed::from([(1, None), (2, None)]));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1386,7 +1619,7 @@ mod tests {
 
         let (command_tx, mut command_rx) = mpsc::unbounded_channel();
         let (_shutdown_tx, mut shutdown_rx) = watch::channel(());
-        let mut subscribed = HashSet::from([1]);
+        let mut subscribed = Subscribed::from([(1, None)]);
         command_tx.send(ShardCommand::Unsubscribe(1)).unwrap();
 
         let turn = await_turn(&pacer, &mut subscribed, &mut command_rx, &mut shutdown_rx).await;
@@ -1402,7 +1635,7 @@ mod tests {
 
         let (_command_tx, mut command_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, mut shutdown_rx) = watch::channel(());
-        let mut subscribed = HashSet::from([1]);
+        let mut subscribed = Subscribed::from([(1, None)]);
         shutdown_tx.send(()).unwrap();
 
         let turn = await_turn(&pacer, &mut subscribed, &mut command_rx, &mut shutdown_rx).await;

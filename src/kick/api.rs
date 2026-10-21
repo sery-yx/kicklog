@@ -79,6 +79,9 @@ pub struct WebChannel {
     pub slug: String,
     /// The id the chat of the channel is published under. Not the same as the channel or user id.
     pub chatroom_id: u64,
+    /// Kick's id of the channel, which is not the user id of the broadcaster either. The Kicks
+    /// gifts of the channel are published under it. `None` if the answer does not have it.
+    pub kick_channel_id: Option<u64>,
 }
 
 struct AppToken {
@@ -503,10 +506,17 @@ fn parse_web_channel(body: &Value) -> Result<WebChannel, KickError> {
         .and_then(|id| id.as_u64())
         .ok_or_else(|| KickError::Response("the channel has no chatroom id".to_owned()))?;
 
+    // The channel id is in the chatroom, and is the `id` of the channel itself
+    let positive_id = |id: Option<&Value>| id.and_then(|id| id.as_u64()).filter(|id| *id > 0);
+    let kick_channel_id =
+        positive_id(body.get("chatroom").and_then(|chatroom| chatroom.get("channel_id")))
+            .or_else(|| positive_id(body.get("id")));
+
     Ok(WebChannel {
         user_id,
         slug,
         chatroom_id,
+        kick_channel_id,
     })
 }
 
@@ -731,11 +741,34 @@ mod tests {
                 user_id: "7183419".to_owned(),
                 slug: "amouranth".to_owned(),
                 chatroom_id: 7022952,
+                kick_channel_id: Some(7088698),
             }
         );
 
         assert!(parse_web_channel(&json!({"user_id": 1, "slug": "x"})).is_err());
         assert!(parse_web_channel(&json!({"slug": "x", "chatroom": {"id": 1}})).is_err());
+    }
+
+    #[test]
+    fn the_channel_id_is_found_where_kick_puts_it() {
+        let in_the_chatroom = json!({
+            "user_id": 676, "slug": "xqc", "chatroom": {"id": 668, "channel_id": 669}
+        });
+        assert_eq!(
+            parse_web_channel(&in_the_chatroom).unwrap().kick_channel_id,
+            Some(669)
+        );
+
+        let on_the_channel = json!({
+            "id": 668, "user_id": 676, "slug": "xqc", "chatroom": {"id": 668}
+        });
+        assert_eq!(
+            parse_web_channel(&on_the_channel).unwrap().kick_channel_id,
+            Some(668)
+        );
+
+        let unknown = json!({"user_id": 676, "slug": "xqc", "chatroom": {"id": 668}});
+        assert_eq!(parse_web_channel(&unknown).unwrap().kick_channel_id, None);
     }
 
     #[test]
